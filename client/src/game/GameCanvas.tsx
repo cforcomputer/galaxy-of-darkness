@@ -9,12 +9,7 @@ import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPa
 
 import type { DbConnection } from "../module_bindings";
 import { loadSystemScene, type Celestial } from "../esi";
-import {
-  SCALE_FACTOR,
-  mToWorld,
-  formatDistanceMeters,
-  safeDispose,
-} from "./threeHelpers";
+import { SCALE_FACTOR, mToWorld, formatDistanceMeters, safeDispose } from "./threeHelpers";
 
 import { DEFAULT_SHIP_STATS } from "./shipConfig";
 import { spawnDefaultCombatSite, computeSiteWarpInWorld } from "./combatSites";
@@ -23,7 +18,7 @@ import { spawnNpcWave, type NpcSpec } from "./npcs";
 import "./game.css";
 
 type Props = {
-  conn: DbConnection; // reserved for multiplayer; currently unused
+  conn: DbConnection;
   identityHex: string;
 };
 
@@ -50,6 +45,10 @@ const WARP_ALIGN_MIN_TIME = 0.35; // prevents “instant” warp from standstill
 const LOCK_RANGE_M = 100_000; // 100 km
 const MAX_LOCKS = 5;
 
+// Visibility / Grid rule (combat site)
+const GRID_VISIBILITY_RANGE_M = 100_000_000; // 100,000 km
+const GRID_VISIBILITY_RANGE_WORLD = GRID_VISIBILITY_RANGE_M * SCALE_FACTOR;
+
 // Sublight
 const SUBLIGHT_MAX_SPEED = 3000 * SCALE_FACTOR; // world units / sec
 const SUBLIGHT_ACCEL = 900 * SCALE_FACTOR;
@@ -70,6 +69,7 @@ const SPRITE_PX_BODY = 14;
 const SPRITE_PX_STAR = 18;
 const SPRITE_PX_SITE = 16;
 const SPRITE_PX_NPC = 16;
+const SPRITE_PX_WRECK = 14;
 const SPRITE_SCALE_MIN = 0.0000005;
 const SPRITE_SCALE_MAX = 0.5;
 
@@ -119,18 +119,35 @@ const NAV_DIR_SMOOTHING = 1.0; // derived from turn rate (keep 1.0)
 const LAYER_WORLD = 0;
 const LAYER_SHIP = 1;
 
-// Tracer (gun line)
-const TRACER_TTL_S = 0.11;
-const TRACER_INTENSITY = 6.0;
+// Tracer (gun line) — slower bloom pulse (less messy)
+const TRACER_TTL_S = 0.32;
+const TRACER_MAX_ACTIVE = 18;
+const TRACER_OPACITY_PEAK = 0.85;
 
 // NPC visuals
-const NPC_SPHERE_RADIUS_M = 350; // optional red sphere size
+const NPC_SPHERE_RADIUS_M = 350;
 const NPC_SPHERE_RADIUS_WORLD = NPC_SPHERE_RADIUS_M * SCALE_FACTOR;
+
+// Wreck visuals
+const WRECK_SPHERE_RADIUS_M = 260;
+const WRECK_SPHERE_RADIUS_WORLD = WRECK_SPHERE_RADIUS_M * SCALE_FACTOR;
 
 // Encounter
 const ENCOUNTER_WAVE_DELAY_MS = 1200;
 
-type SpaceKind = Celestial["kind"] | "combat_site" | "npc";
+// Inventory (placeholder item defs)
+type ItemDef = { id: string; name: string; volume_m3: number };
+
+const ITEM_DEFS: Record<string, ItemDef> = {
+  damaged_circuit: { id: "damaged_circuit", name: "Damaged Circuit", volume_m3: 5.0 },
+};
+
+type InventoryStack = {
+  itemId: string;
+  qty: number;
+};
+
+type SpaceKind = Celestial["kind"] | "combat_site" | "npc" | "wreck";
 
 type CelestialMeta = Celestial & {
   radiusWorld: number;
@@ -165,7 +182,18 @@ type NpcMeta = {
   sprite: THREE.Sprite;
 };
 
-type SpaceMeta = CelestialMeta | CombatSiteMeta | NpcMeta;
+type WreckMeta = {
+  key: string;
+  kind: "wreck";
+  name: string;
+  posWorld: THREE.Vector3;
+  contents: InventoryStack[];
+
+  mesh: THREE.Mesh;
+  sprite: THREE.Sprite;
+};
+
+type SpaceMeta = CelestialMeta | CombatSiteMeta | NpcMeta | WreckMeta;
 
 type OverviewRow = {
   key: string;
@@ -182,6 +210,7 @@ const KIND_LABEL: Record<SpaceKind, string> = {
   station: "STATION",
   combat_site: "COMBAT",
   npc: "NPC",
+  wreck: "WRECK",
 };
 
 function makeMarkerTexture(kind: SpaceKind) {
@@ -203,7 +232,9 @@ function makeMarkerTexture(kind: SpaceKind) {
               ? "#FF4CF0"
               : kind === "combat_site"
                 ? "#FFC94A"
-                : "#FF3B3B"; // npc
+                : kind === "wreck"
+                  ? "#B78C6A"
+                  : "#FF3B3B"; // npc
 
   ctx.clearRect(0, 0, 64, 64);
 
@@ -247,10 +278,7 @@ function makeMarkerTexture(kind: SpaceKind) {
 }
 
 function radiusMetersToWorld(kind: Celestial["kind"], radius_m?: number) {
-  const r =
-    typeof radius_m === "number" && radius_m > 0
-      ? radius_m
-      : FALLBACK_RADIUS_M[kind];
+  const r = typeof radius_m === "number" && radius_m > 0 ? radius_m : FALLBACK_RADIUS_M[kind];
   return r * SCALE_FACTOR;
 }
 
@@ -261,7 +289,9 @@ function centerDistanceMeters(shipPosWorld: THREE.Vector3, posWorld: THREE.Vecto
 // For overview: show surface-ish distance for big bodies (except star)
 function effectiveDistanceMeters(shipPosWorld: THREE.Vector3, meta: SpaceMeta) {
   const centerDistMeters = shipPosWorld.distanceTo(meta.posWorld) / SCALE_FACTOR;
-  if (meta.kind === "star" || meta.kind === "combat_site" || meta.kind === "npc") return centerDistMeters;
+  if (meta.kind === "star" || meta.kind === "combat_site" || meta.kind === "npc" || meta.kind === "wreck") {
+    return centerDistMeters;
+  }
 
   const c = meta as CelestialMeta;
   const radiusMeters = c.radiusWorld / SCALE_FACTOR;
@@ -269,13 +299,8 @@ function effectiveDistanceMeters(shipPosWorld: THREE.Vector3, meta: SpaceMeta) {
   return Math.max(0, adjusted);
 }
 
-// ✅ Warp-in points should be on the sun-facing (lit) side of the body, most of the time.
-function computeFixedWarpInWorld(
-  starPosWorld: THREE.Vector3,
-  bodyPosWorld: THREE.Vector3,
-  bodyRadiusWorld: number
-) {
-  // Direction from body toward star = sun-facing direction
+// Warp-in points should be on the sun-facing (lit) side of the body.
+function computeFixedWarpInWorld(starPosWorld: THREE.Vector3, bodyPosWorld: THREE.Vector3, bodyRadiusWorld: number) {
   const dirToStar = starPosWorld.clone().sub(bodyPosWorld);
   if (dirToStar.lengthSq() < 1e-12) dirToStar.set(1, 0, 0);
   else dirToStar.normalize();
@@ -285,12 +310,7 @@ function computeFixedWarpInWorld(
 }
 
 // More numerically-stable segment-sphere test
-function segmentIntersectsSphere(
-  a: THREE.Vector3,
-  b: THREE.Vector3,
-  center: THREE.Vector3,
-  radius: number
-): boolean {
+function segmentIntersectsSphere(a: THREE.Vector3, b: THREE.Vector3, center: THREE.Vector3, radius: number): boolean {
   const ab = b.clone().sub(a);
   const abLenSq = ab.lengthSq();
   if (abLenSq < 1e-16) return a.distanceTo(center) <= radius;
@@ -314,6 +334,52 @@ function formatSpeed(mps: number, unit: "mps" | "aups") {
   if (abs >= 10_000) return `${(mps / 1000).toFixed(1)} km/s`;
   if (abs >= 1000) return `${mps.toFixed(0)} m/s`;
   return `${mps.toFixed(0)} m/s`;
+}
+
+// --- Inventory helpers --------------------------------------------------------
+
+function invNormalize(stacks: InventoryStack[]): InventoryStack[] {
+  const map = new Map<string, number>();
+  for (const s of stacks) {
+    if (!s.itemId || !isFinite(s.qty) || s.qty <= 0) continue;
+    map.set(s.itemId, (map.get(s.itemId) ?? 0) + Math.floor(s.qty));
+  }
+  return Array.from(map.entries()).map(([itemId, qty]) => ({ itemId, qty }));
+}
+
+function invUsedVolumeM3(stacks: InventoryStack[]): number {
+  let used = 0;
+  for (const s of stacks) {
+    const def = ITEM_DEFS[s.itemId];
+    if (!def) continue;
+    used += def.volume_m3 * s.qty;
+  }
+  return used;
+}
+
+function invCanFit(stacks: InventoryStack[], add: InventoryStack[], capacity_m3: number): boolean {
+  const merged = invNormalize([...stacks, ...add]);
+  return invUsedVolumeM3(merged) <= capacity_m3 + 1e-6;
+}
+
+function loadInventoryLocal(storageKey: string): InventoryStack[] {
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as InventoryStack[];
+    if (!Array.isArray(parsed)) return [];
+    return invNormalize(parsed);
+  } catch {
+    return [];
+  }
+}
+
+function saveInventoryLocal(storageKey: string, stacks: InventoryStack[]) {
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(invNormalize(stacks)));
+  } catch {
+    // ignore
+  }
 }
 
 // --- Sky ----------------------------------------------------------------------
@@ -368,14 +434,7 @@ function createProceduralSkySphere() {
 // --- Warp tunnel --------------------------------------------------------------
 
 function createWarpTunnelAuroraCylinderWorld() {
-  const geom = new THREE.CylinderGeometry(
-    WARP_TUNNEL_RADIUS,
-    WARP_TUNNEL_RADIUS,
-    WARP_TUNNEL_LENGTH,
-    220,
-    1,
-    true
-  );
+  const geom = new THREE.CylinderGeometry(WARP_TUNNEL_RADIUS, WARP_TUNNEL_RADIUS, WARP_TUNNEL_LENGTH, 220, 1, true);
   geom.rotateX(Math.PI / 2);
 
   const uniforms = {
@@ -487,7 +546,9 @@ function createWarpFlashPlane() {
   return { mesh, mat };
 }
 
-export default function GameCanvas({ identityHex }: Props) {
+export default function GameCanvas({ conn, identityHex }: Props) {
+  const connAny = conn as any;
+
   const canvasHostRef = useRef<HTMLDivElement | null>(null);
 
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -513,11 +574,7 @@ export default function GameCanvas({ identityHex }: Props) {
 
   const warpTunnelRef = useRef<{
     mesh: THREE.Mesh;
-    uniforms: {
-      uTime: { value: number };
-      uIntensity: { value: number };
-      uSpeed: { value: number };
-    };
+    uniforms: { uTime: { value: number }; uIntensity: { value: number }; uSpeed: { value: number } };
     geom: THREE.BufferGeometry;
     mat: THREE.ShaderMaterial;
   } | null>(null);
@@ -544,7 +601,7 @@ export default function GameCanvas({ identityHex }: Props) {
     alignTime: number;
   } | null>(null);
 
-  // Markers for picking (celestials + sites + npc markers)
+  // Markers for picking (celestials + sites + npc markers + wreck markers)
   const spriteMetaRef = useRef<Map<THREE.Object3D, SpaceMeta>>(new Map());
   const spritesRef = useRef<THREE.Sprite[]>([]);
   const spriteMatsRef = useRef<Map<THREE.Sprite, THREE.SpriteMaterial>>(new Map());
@@ -552,6 +609,7 @@ export default function GameCanvas({ identityHex }: Props) {
   const celestialsRef = useRef<CelestialMeta[]>([]);
   const combatSitesRef = useRef<CombatSiteMeta[]>([]);
   const npcsRef = useRef<NpcMeta[]>([]);
+  const wrecksRef = useRef<WreckMeta[]>([]);
 
   const encounterRef = useRef<{ siteKey: string; wave: 0 | 1 | 2 | 3; nextWaveAt: number } | null>(null);
 
@@ -571,11 +629,7 @@ export default function GameCanvas({ identityHex }: Props) {
   const [systemName, setSystemName] = useState("Loading…");
   const [hover, setHover] = useState<HoverInfo | null>(null);
 
-  const [ctxMenu, setCtxMenu] = useState<{
-    x: number;
-    y: number;
-    target: SpaceMeta;
-  } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; target: SpaceMeta } | null>(null);
 
   const shipStats = DEFAULT_SHIP_STATS;
 
@@ -605,6 +659,11 @@ export default function GameCanvas({ identityHex }: Props) {
 
   const [overviewRows, setOverviewRows] = useState<OverviewRow[]>([]);
 
+  // Inventory (client state; DB-backed hook points included)
+  const inventoryStorageKey = useMemo(() => `god_inventory_${identityHex}`, [identityHex]);
+  const [cargo, setCargo] = useState<InventoryStack[]>(() => loadInventoryLocal(inventoryStorageKey));
+  const cargoUsedM3 = useMemo(() => invUsedVolumeM3(cargo), [cargo]);
+
   useEffect(() => {
     selectedKeyRef.current = selectedKey;
   }, [selectedKey]);
@@ -633,17 +692,70 @@ export default function GameCanvas({ identityHex }: Props) {
     hullRef.current = hull;
   }, [hull]);
 
+  // Persist inventory locally as a safety net (server persistence is handled via module reducers/tables)
+  useEffect(() => {
+    saveInventoryLocal(inventoryStorageKey, cargo);
+  }, [cargo, inventoryStorageKey]);
+
+  // Best-effort DB read hook (kept defensive; relies on your module schema)
+  useEffect(() => {
+    // If your module exposes an inventory table, you can wire it here.
+    // This file stays runtime-safe even before the schema lands.
+    try {
+      const db = connAny?.db;
+      const table = db?.inventory_item ?? db?.inventoryItem ?? null;
+      if (!table || typeof table?.iter !== "function") return;
+
+      const stacks: InventoryStack[] = [];
+      for (const row of table.iter()) {
+        const ownerHex: string | undefined =
+          row?.owner_hex ?? row?.ownerHex ?? row?.owner ?? row?.identity ?? row?.player_hex ?? undefined;
+
+        if (ownerHex && ownerHex !== identityHex) continue;
+
+        const itemId: string | undefined = row?.item_id ?? row?.itemId ?? row?.item ?? undefined;
+        const qty: number | undefined = row?.qty ?? row?.quantity ?? row?.count ?? undefined;
+
+        if (itemId && typeof qty === "number" && qty > 0) stacks.push({ itemId, qty });
+      }
+      if (stacks.length) setCargo(invNormalize(stacks));
+    } catch {
+      // ignore
+    }
+  }, [connAny, identityHex]);
+
   const findSpaceByKey = (key: string | null): SpaceMeta | null => {
     if (!key) return null;
 
     for (const n of npcsRef.current) if (n.key === key) return n;
+    for (const w of wrecksRef.current) if (w.key === key) return w;
     for (const s of combatSitesRef.current) if (s.key === key) return s;
     for (const c of celestialsRef.current) if (c.key === key) return c;
 
     return null;
   };
 
+  const getPrimaryCombatSite = (): CombatSiteMeta | null => {
+    return combatSitesRef.current.length ? combatSitesRef.current[0] : null;
+  };
+
+  const inCombatGridNow = (): boolean => {
+    const site = getPrimaryCombatSite();
+    if (!site) return false;
+    const shipPos = shipPosRef.current;
+    return shipPos.distanceTo(site.posWorld) <= GRID_VISIBILITY_RANGE_WORLD;
+  };
+
+  const isEntityVisibleToPlayer = (m: SpaceMeta): boolean => {
+    // Base rule: NPCs and their wrecks are only visible within grid range of the combat site.
+    if (m.kind === "npc" || m.kind === "wreck") return inCombatGridNow();
+    return true;
+  };
+
   const canLockNow = (meta: SpaceMeta) => {
+    if (meta.kind === "wreck") return false;
+    if (!isEntityVisibleToPlayer(meta)) return false;
+
     const shipPos = shipPosRef.current;
     const d = effectiveDistanceMeters(shipPos, meta);
     return d <= LOCK_RANGE_M;
@@ -660,7 +772,6 @@ export default function GameCanvas({ identityHex }: Props) {
       return [...prev, key];
     });
 
-    // initialize hp bar
     setTargetTestHp((prev) => {
       if (prev[key] != null) return prev;
       if (meta.kind === "npc") {
@@ -691,11 +802,26 @@ export default function GameCanvas({ identityHex }: Props) {
   const isLocked = (key: string) => lockedKeysRef.current.includes(key);
 
   const canFire = useMemo(() => {
-    return !!activeLockedKey;
+    const k = activeLockedKey;
+    if (!k) return false;
+    const t = findSpaceByKey(k);
+    if (!t) return false;
+    if (t.kind !== "npc" && (t.kind as any) !== "combat_site") {
+      // keep current behavior: allow firing at any locked key, but NPCs are the real combat target
+      // (this prevents UI disabling for celestials if you want test HP bars)
+    }
+    if (!isEntityVisibleToPlayer(t)) return false;
+    return true;
   }, [activeLockedKey]);
 
   const toggleFire = () => {
-    if (!activeLockedKeyRef.current) {
+    const k = activeLockedKeyRef.current;
+    if (!k) {
+      setFiring(false);
+      return;
+    }
+    const t = findSpaceByKey(k);
+    if (!t || !isEntityVisibleToPlayer(t) || t.kind === "wreck") {
       setFiring(false);
       return;
     }
@@ -704,6 +830,8 @@ export default function GameCanvas({ identityHex }: Props) {
 
   const approachTo = (m: SpaceMeta) => {
     if (warpRef.current?.active) return;
+    if (!isEntityVisibleToPlayer(m)) return;
+
     setSelectedKey(m.key);
     approachRef.current = {
       active: true,
@@ -717,17 +845,14 @@ export default function GameCanvas({ identityHex }: Props) {
 
   const warpTo = (m: SpaceMeta) => {
     if (warpRef.current?.active) return;
-    if (m.kind === "npc") return; // no warp-to NPCs for now
+    if (m.kind === "npc" || m.kind === "wreck") return;
 
     approachRef.current = null;
     sublightDirRef.current = null;
 
     const shipPos = shipPosRef.current.clone();
-
     const dest =
-      m.kind === "combat_site"
-        ? computeSiteWarpInWorld(shipPos, m.posWorld)
-        : (m as CelestialMeta).warpInWorld.clone();
+      m.kind === "combat_site" ? computeSiteWarpInWorld(shipPos, m.posWorld) : (m as CelestialMeta).warpInWorld.clone();
 
     warpRef.current = {
       active: true,
@@ -742,6 +867,56 @@ export default function GameCanvas({ identityHex }: Props) {
     setCtxMenu(null);
   };
 
+  const lootAllFromWreck = (wreck: WreckMeta) => {
+    const add = wreck.contents.map((s) => ({ ...s }));
+    if (!add.length) return;
+
+    const capacity = shipStats.cargoCapacity_m3;
+    if (!invCanFit(cargo, add, capacity)) {
+      // If you want partial looting later, split by volume here.
+      return;
+    }
+
+    const next = invNormalize([...cargo, ...add]);
+    setCargo(next);
+
+    // Best-effort DB persist hook
+    try {
+      const reducers = connAny?.reducers;
+      if (reducers) {
+        // If your module has explicit reducers, wire them here.
+        // Example patterns:
+        // reducers.inventory_add?.({ item_id: add[0].itemId, qty: add[0].qty })
+        // reducers.loot_wreck_all?.({ wreck_key: wreck.key })
+      }
+    } catch {
+      // ignore
+    }
+
+    // Remove wreck after looting
+    const removeWreck = (w: WreckMeta) => {
+      w.mesh.removeFromParent();
+      w.sprite.removeFromParent();
+      safeDispose(w.mesh);
+
+      const smat = w.sprite.material as any;
+      if (smat?.map?.dispose) smat.map.dispose();
+      smat?.dispose?.();
+
+      spritesRef.current = spritesRef.current.filter((s) => s !== w.sprite);
+      spriteMatsRef.current.delete(w.sprite);
+      spriteMetaRef.current.delete(w.sprite);
+
+      wrecksRef.current = wrecksRef.current.filter((x) => x.key !== w.key);
+
+      if (lockedKeysRef.current.includes(w.key)) unlockTarget(w.key);
+      if (selectedKeyRef.current === w.key) setSelectedKey(null);
+    };
+
+    removeWreck(wreck);
+    setCtxMenu(null);
+  };
+
   useEffect(() => {
     const host = canvasHostRef.current;
     if (!host) return;
@@ -751,15 +926,8 @@ export default function GameCanvas({ identityHex }: Props) {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x000000);
 
-    const camera = new THREE.PerspectiveCamera(
-      65,
-      host.clientWidth / host.clientHeight,
-      1e-7,
-      1_000_000_000
-    );
-
+    const camera = new THREE.PerspectiveCamera(65, host.clientWidth / host.clientHeight, 1e-7, 1_000_000_000);
     camera.layers.enable(LAYER_SHIP);
-
     camera.position.set(0.00003, 0.000012, 0.00003);
     scene.add(camera);
 
@@ -882,20 +1050,30 @@ export default function GameCanvas({ identityHex }: Props) {
     };
     window.addEventListener("resize", onResize);
 
-    const tmp = new THREE.Vector3();
     const q = new THREE.Quaternion();
     const baseAxis = new THREE.Vector3(0, 0, 1);
 
-    const spawnTracer = (fromWorld: THREE.Vector3, toWorld: THREE.Vector3) => {
+    const spawnTracerPulse = (fromWorld: THREE.Vector3, toWorld: THREE.Vector3) => {
       const sc = sceneRef.current;
       if (!sc) return;
 
+      // Cap active tracers to avoid visual spam.
+      if (tracersRef.current.length >= TRACER_MAX_ACTIVE) {
+        const oldest = tracersRef.current.shift();
+        if (oldest) {
+          oldest.line.removeFromParent();
+          oldest.line.geometry?.dispose?.();
+          (oldest.line.material as any)?.dispose?.();
+        }
+      }
+
       const geom = new THREE.BufferGeometry().setFromPoints([fromWorld.clone(), toWorld.clone()]);
       const mat = new THREE.LineBasicMaterial({
-        color: new THREE.Color(TRACER_INTENSITY, TRACER_INTENSITY, TRACER_INTENSITY),
+        color: 0xffffff,
         transparent: true,
-        opacity: 1,
+        opacity: 0,
       });
+      mat.blending = THREE.AdditiveBlending;
       (mat as any).toneMapped = false;
 
       const line = new THREE.Line(geom, mat);
@@ -911,11 +1089,9 @@ export default function GameCanvas({ identityHex }: Props) {
       let a = armorRef.current;
       let h = hullRef.current;
 
-      // armor first
       const armorTaken = Math.min(a, dmgArmor);
       a -= armorTaken;
 
-      // overflow armor damage to hull
       const overflow = dmgArmor - armorTaken;
       const hullFromOverflow = Math.max(0, overflow);
 
@@ -931,7 +1107,7 @@ export default function GameCanvas({ identityHex }: Props) {
       setHull(h);
 
       if (h <= 0) {
-        // Player “dies” -> respawn where it died (no teleport for now)
+        // Player dies -> respawn where it died (no teleport for now)
         armorRef.current = shipStats.maxArmor;
         hullRef.current = shipStats.maxHull;
         setArmor(shipStats.maxArmor);
@@ -946,23 +1122,76 @@ export default function GameCanvas({ identityHex }: Props) {
       }
     };
 
-    const killNpc = (npc: NpcMeta) => {
-      // remove visuals
+    const removeNpc = (npc: NpcMeta) => {
       npc.mesh.removeFromParent();
       npc.sprite.removeFromParent();
       safeDispose(npc.mesh);
-      if (npc.sprite.material) (npc.sprite.material as any).dispose?.();
 
-      // remove from selection arrays
+      const smat = npc.sprite.material as any;
+      if (smat?.map?.dispose) smat.map.dispose();
+      smat?.dispose?.();
+
       spritesRef.current = spritesRef.current.filter((s) => s !== npc.sprite);
       spriteMatsRef.current.delete(npc.sprite);
       spriteMetaRef.current.delete(npc.sprite);
 
-      // remove from npc list
       npcsRef.current = npcsRef.current.filter((n) => n.key !== npc.key);
 
-      // if locked, unlock
       if (lockedKeysRef.current.includes(npc.key)) unlockTarget(npc.key);
+    };
+
+    const spawnWreckForNpc = (npc: NpcMeta) => {
+      const sc = sceneRef.current;
+      if (!sc) return;
+
+      const wreckKey = `wreck:${npc.key}`;
+      const wreckPos = npc.posWorld.clone();
+
+      const contents: InventoryStack[] = [{ itemId: "damaged_circuit", qty: 1 }];
+
+      const wreckMat = new THREE.MeshStandardMaterial({
+        color: 0x8a6a52,
+        emissive: new THREE.Color(0x2a1a12),
+        emissiveIntensity: 0.6,
+        roughness: 0.85,
+        metalness: 0.1,
+      });
+
+      const wreckMesh = new THREE.Mesh(new THREE.SphereGeometry(WRECK_SPHERE_RADIUS_WORLD, 12, 10), wreckMat);
+      wreckMesh.position.copy(wreckPos);
+      wreckMesh.layers.set(LAYER_WORLD);
+      wreckMesh.userData.godSystem = true;
+      sc.add(wreckMesh);
+
+      const tex = makeMarkerTexture("wreck");
+      const smat = new THREE.SpriteMaterial({
+        map: tex,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+        depthTest: true,
+      });
+
+      const sprite = new THREE.Sprite(smat);
+      sprite.position.copy(wreckPos);
+      sprite.layers.set(LAYER_WORLD);
+      sprite.userData.godSystem = true;
+      sc.add(sprite);
+
+      const meta: WreckMeta = {
+        key: wreckKey,
+        kind: "wreck",
+        name: "Wreck",
+        posWorld: wreckPos,
+        contents,
+        mesh: wreckMesh,
+        sprite,
+      };
+
+      wrecksRef.current.push(meta);
+      spritesRef.current.push(sprite);
+      spriteMatsRef.current.set(sprite, smat);
+      spriteMetaRef.current.set(sprite, meta);
     };
 
     const damageNpc = (npc: NpcMeta, dmg: number) => {
@@ -971,23 +1200,26 @@ export default function GameCanvas({ identityHex }: Props) {
         const pct = Math.round((npc.hp / Math.max(1, npc.maxHp)) * 100);
         setTargetTestHp((prev) => ({ ...prev, [npc.key]: pct }));
       }
-      if (npc.hp <= 0) killNpc(npc);
+      if (npc.hp <= 0) {
+        spawnWreckForNpc(npc);
+        removeNpc(npc);
+      }
     };
 
     const performShot = (targetKey: string, originWorld: THREE.Vector3) => {
       const meta = findSpaceByKey(targetKey);
       if (!meta) return;
+      if (!isEntityVisibleToPlayer(meta)) return;
 
-      spawnTracer(originWorld, meta.posWorld);
+      spawnTracerPulse(originWorld, meta.posWorld);
 
-      // If NPC: actually damage it
       if (meta.kind === "npc") {
         const dmg = shipStats.weapon.damage.armor + shipStats.weapon.damage.hull;
         damageNpc(meta, dmg);
         return;
       }
 
-      // Otherwise: keep your old “test hp” behavior
+      // Keep old “test hp” behavior for non-NPC targets
       setTargetTestHp((prev) => {
         const cur = prev[targetKey] ?? 100;
         const next = Math.max(0, cur - 5);
@@ -1017,11 +1249,13 @@ export default function GameCanvas({ identityHex }: Props) {
       const enc = encounterRef.current;
       if (!enc) return;
 
+      // Grid rule: no spawning / combat outside the combat-site grid
+      if (!inCombatGridNow()) return;
+
       const alive = npcsRef.current.length;
       if (alive > 0) return;
 
       if (nowMs < enc.nextWaveAt) return;
-
       if (enc.wave >= 3) return;
 
       const nextWave = (enc.wave + 1) as 1 | 2 | 3;
@@ -1046,10 +1280,7 @@ export default function GameCanvas({ identityHex }: Props) {
           metalness: 0.0,
         });
 
-        const npcMesh = new THREE.Mesh(
-          new THREE.SphereGeometry(NPC_SPHERE_RADIUS_WORLD, 14, 12),
-          npcMat
-        );
+        const npcMesh = new THREE.Mesh(new THREE.SphereGeometry(NPC_SPHERE_RADIUS_WORLD, 14, 12), npcMat);
         npcMesh.position.copy(sp.posWorld);
         npcMesh.layers.set(LAYER_WORLD);
         npcMesh.userData.godSystem = true;
@@ -1093,11 +1324,13 @@ export default function GameCanvas({ identityHex }: Props) {
     };
 
     const stepNpcs = (dt: number) => {
+      // Grid rule: NPCs do nothing outside grid range
+      if (!inCombatGridNow()) return;
+
       const now = performance.now();
       const shipPos = shipPosRef.current;
 
       for (const npc of npcsRef.current) {
-        // Maintain range ~5km with some strafe
         const toShip = shipPos.clone().sub(npc.posWorld);
         const distWorld = toShip.length();
         const distM = distWorld / SCALE_FACTOR;
@@ -1128,8 +1361,7 @@ export default function GameCanvas({ identityHex }: Props) {
         // Fire if in range
         if (distM <= npc.spec.range_m && now >= npc.nextFireAt) {
           npc.nextFireAt = now + npc.spec.cooldownMs;
-
-          spawnTracer(npc.posWorld, shipPos);
+          spawnTracerPulse(npc.posWorld, shipPos);
           applyDamageToPlayer(npc.spec.damage.armor, npc.spec.damage.hull);
         }
       }
@@ -1146,20 +1378,23 @@ export default function GameCanvas({ identityHex }: Props) {
           firingRef.current = false;
           setFiring(false);
         } else {
-          const now = performance.now();
-          if (now >= nextFireAtRef.current) {
-            if (!lockedKeysRef.current.includes(active)) {
-              firingRef.current = false;
-              setFiring(false);
-            } else {
-              const meta = findSpaceByKey(active);
-              if (meta) {
+          const meta = findSpaceByKey(active);
+          if (!meta || meta.kind === "wreck" || !isEntityVisibleToPlayer(meta)) {
+            firingRef.current = false;
+            setFiring(false);
+          } else {
+            const now = performance.now();
+            if (now >= nextFireAtRef.current) {
+              if (!lockedKeysRef.current.includes(active)) {
+                firingRef.current = false;
+                setFiring(false);
+              } else {
                 const distMeters = centerDistanceMeters(shipPos, meta.posWorld);
                 if (distMeters <= shipStats.weapon.range_m) {
                   performShot(active, shipPos.clone());
                 }
+                nextFireAtRef.current = now + shipStats.weapon.cooldownMs;
               }
-              nextFireAtRef.current = now + shipStats.weapon.cooldownMs;
             }
           }
         }
@@ -1304,11 +1539,8 @@ export default function GameCanvas({ identityHex }: Props) {
       const targetSpeed = SUBLIGHT_MAX_SPEED;
 
       let newSpeed = currentSpeed;
-      if (currentSpeed < targetSpeed) {
-        newSpeed = Math.min(targetSpeed, currentSpeed + SUBLIGHT_ACCEL * dt);
-      } else {
-        newSpeed = Math.max(targetSpeed, currentSpeed - SUBLIGHT_DECEL * dt);
-      }
+      if (currentSpeed < targetSpeed) newSpeed = Math.min(targetSpeed, currentSpeed + SUBLIGHT_ACCEL * dt);
+      else newSpeed = Math.max(targetSpeed, currentSpeed - SUBLIGHT_DECEL * dt);
 
       shipVel.copy(nav.clone().multiplyScalar(newSpeed));
       shipPos.addScaledVector(shipVel, dt);
@@ -1337,6 +1569,36 @@ export default function GameCanvas({ identityHex }: Props) {
 
       if (skyObj) skyObj.mat.uniforms.uTime.value += dt;
 
+      // Grid visibility toggles (NPCs + wrecks)
+      {
+        const gridActive = inCombatGridNow();
+        for (const n of npcsRef.current) {
+          n.mesh.visible = gridActive;
+          n.sprite.visible = gridActive;
+        }
+        for (const w of wrecksRef.current) {
+          w.mesh.visible = gridActive;
+          w.sprite.visible = gridActive;
+        }
+
+        // If we leave grid, drop locks on non-visible entities (base rule)
+        if (!gridActive) {
+          const locked = lockedKeysRef.current.slice();
+          for (const k of locked) {
+            const m = findSpaceByKey(k);
+            if (m && (m.kind === "npc" || m.kind === "wreck")) unlockTarget(k);
+          }
+          if (activeLockedKeyRef.current) {
+            const m = findSpaceByKey(activeLockedKeyRef.current);
+            if (m && (m.kind === "npc" || m.kind === "wreck")) {
+              setFiring(false);
+              firingRef.current = false;
+              setActiveLockedKey(null);
+            }
+          }
+        }
+      }
+
       // camera locked to ship translation
       const newShipPos = shipPosRef.current;
       const lastShipPos = lastShipPosRef.current;
@@ -1348,9 +1610,7 @@ export default function GameCanvas({ identityHex }: Props) {
 
       // ship faces smoothed nav dir
       const fwdDir = shipForwardRef.current;
-      if (fwdDir.lengthSq() > 0.000001) {
-        shipObj.lookAt(shipObj.position.clone().add(fwdDir));
-      }
+      if (fwdDir.lengthSq() > 0.000001) shipObj.lookAt(shipObj.position.clone().add(fwdDir));
 
       const warping = !!warpRef.current?.active;
       ctrl.maxDistance = warping ? CAMERA_MAX_DISTANCE_WARP : CAMERA_MAX_DISTANCE_DEFAULT;
@@ -1358,24 +1618,22 @@ export default function GameCanvas({ identityHex }: Props) {
       // clamp camera distance
       const camToTarget = new THREE.Vector3().copy(cam.position).sub(ctrl.target);
       const camDist = camToTarget.length();
-      if (camDist > ctrl.maxDistance) {
-        cam.position.copy(ctrl.target.clone().add(camToTarget.multiplyScalar(ctrl.maxDistance / camDist)));
-      }
-      if (camDist < ctrl.minDistance) {
-        cam.position.copy(ctrl.target.clone().add(camToTarget.normalize().multiplyScalar(ctrl.minDistance)));
-      }
+      if (camDist > ctrl.maxDistance) cam.position.copy(ctrl.target.clone().add(camToTarget.multiplyScalar(ctrl.maxDistance / camDist)));
+      if (camDist < ctrl.minDistance) cam.position.copy(ctrl.target.clone().add(camToTarget.normalize().multiplyScalar(ctrl.minDistance)));
 
       // sprites constant screen-size scaling
       const viewportH = Math.max(1, rendererRef.current?.domElement.clientHeight ?? 1);
       const fovRad = THREE.MathUtils.degToRad(cam.fov);
-      const pxToWorldAtDist = (dist: number) =>
-        (2 * dist * Math.tan(fovRad / 2)) / viewportH;
+      const pxToWorldAtDist = (dist: number) => (2 * dist * Math.tan(fovRad / 2)) / viewportH;
 
       const sel = selectedKeyRef.current;
 
       for (const s of spritesRef.current) {
         const meta = spriteMetaRef.current.get(s);
         if (!meta) continue;
+
+        // Grid visibility: don't scale (or highlight) hidden entities
+        if (!isEntityVisibleToPlayer(meta)) continue;
 
         const d = s.position.distanceTo(cam.position);
         const desiredPx =
@@ -1385,7 +1643,9 @@ export default function GameCanvas({ identityHex }: Props) {
               ? SPRITE_PX_SITE
               : meta.kind === "npc"
                 ? SPRITE_PX_NPC
-                : SPRITE_PX_BODY;
+                : meta.kind === "wreck"
+                  ? SPRITE_PX_WRECK
+                  : SPRITE_PX_BODY;
 
         const worldSize = pxToWorldAtDist(d) * desiredPx;
         const size = THREE.MathUtils.clamp(worldSize, SPRITE_SCALE_MIN, SPRITE_SCALE_MAX);
@@ -1419,7 +1679,6 @@ export default function GameCanvas({ identityHex }: Props) {
           }
         }
 
-        // darker in shadow (this was previously too bright)
         const targetMult = occluded ? 0.012 : 1.0;
         const current = shipShadowMultRef.current;
         const lerp = 1 - Math.pow(0.0001, dt);
@@ -1428,29 +1687,39 @@ export default function GameCanvas({ identityHex }: Props) {
 
         shipStar.key.intensity = STAR_KEY_INTENSITY * next;
         shipStar.fill.intensity = STAR_FILL_INTENSITY * (0.12 + 0.88 * next);
+
+        // Also dim bounce lights so ship doesn't stay “lit” in deep shadow.
+        const bk = bounceKeyRef.current;
+        const bb = bounceBackRef.current;
+        if (bk) bk.intensity = BOUNCE_KEY_INTENSITY * (0.35 + 0.65 * next);
+        if (bb) bb.intensity = BOUNCE_BACK_INTENSITY * (0.40 + 0.60 * next);
       }
 
-      // update tracers (fade + cleanup)
+      // update tracers (pulse fade + cleanup)
       {
         const now = performance.now();
-        const next: typeof tracersRef.current = [];
+        const nextArr: typeof tracersRef.current = [];
         for (const t of tracersRef.current) {
-          const age = (now - t.born) / 1000;
-          const a = 1 - age / t.ttl;
+          const ageS = (now - t.born) / 1000;
+          const life01 = THREE.MathUtils.clamp(ageS / t.ttl, 0, 1);
 
-          if (a <= 0) {
+          if (life01 >= 1) {
             t.line.removeFromParent();
-            if (t.line.geometry) t.line.geometry.dispose();
-            const m = t.line.material as any;
-            m?.dispose?.();
+            t.line.geometry?.dispose?.();
+            (t.line.material as any)?.dispose?.();
             continue;
           }
 
+          // Bloom pulse: sine curve (0 -> peak -> 0)
+          const pulse = Math.sin(Math.PI * life01);
+          const opacity = THREE.MathUtils.clamp(pulse * TRACER_OPACITY_PEAK, 0, 1);
+
           const m = t.line.material as THREE.LineBasicMaterial;
-          m.opacity = a;
-          next.push(t);
+          m.opacity = opacity;
+
+          nextArr.push(t);
         }
-        tracersRef.current = next;
+        tracersRef.current = nextArr;
       }
 
       // warp tunnel
@@ -1478,7 +1747,7 @@ export default function GameCanvas({ identityHex }: Props) {
         if (warping && warpRef.current) {
           const dir = new THREE.Vector3().copy(warpRef.current.destPos).sub(newShipPos).normalize();
           if (dir.lengthSq() > 0.000001) {
-            q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+            q.setFromUnitVectors(baseAxis, dir);
             tunnelObj.mesh.quaternion.copy(q);
             tunnelObj.mesh.position.copy(cam.position).add(dir.multiplyScalar(WARP_TUNNEL_CENTER_FORWARD));
           } else {
@@ -1517,9 +1786,7 @@ export default function GameCanvas({ identityHex }: Props) {
       if (rendererRef.current) rendererRef.current.dispose();
       if (sceneRef.current) safeDispose(sceneRef.current);
 
-      if (renderer.domElement.parentElement === host) {
-        host.removeChild(renderer.domElement);
-      }
+      if (renderer.domElement.parentElement === host) host.removeChild(renderer.domElement);
 
       if (warpTunnelRef.current) {
         warpTunnelRef.current.mesh.removeFromParent();
@@ -1555,6 +1822,7 @@ export default function GameCanvas({ identityHex }: Props) {
       celestialsRef.current = [];
       combatSitesRef.current = [];
       npcsRef.current = [];
+      wrecksRef.current = [];
 
       bounceKeyRef.current = null;
       bounceBackRef.current = null;
@@ -1570,7 +1838,7 @@ export default function GameCanvas({ identityHex }: Props) {
       tracersRef.current = [];
       encounterRef.current = null;
     };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load system + build celestials + lighting + combat site
   useEffect(() => {
@@ -1600,6 +1868,7 @@ export default function GameCanvas({ identityHex }: Props) {
       celestialsRef.current = [];
       combatSitesRef.current = [];
       npcsRef.current = [];
+      wrecksRef.current = [];
       encounterRef.current = null;
 
       // remove old system objects
@@ -1771,10 +2040,7 @@ export default function GameCanvas({ identityHex }: Props) {
           metalness: c.kind === "stargate" ? 0.15 : 0.0,
         });
 
-        const sphere = new THREE.Mesh(
-          new THREE.SphereGeometry(radiusWorld, seg, Math.floor(seg * 0.7)),
-          mat
-        );
+        const sphere = new THREE.Mesh(new THREE.SphereGeometry(radiusWorld, seg, Math.floor(seg * 0.7)), mat);
         sphere.position.copy(pos);
         sphere.userData.godSystem = true;
         sphere.layers.set(LAYER_WORLD);
@@ -1846,34 +2112,26 @@ export default function GameCanvas({ identityHex }: Props) {
   useEffect(() => {
     const t = setInterval(() => {
       const shipPos = shipPosRef.current;
+      const gridActive = inCombatGridNow();
 
       const rows: OverviewRow[] = [];
 
       for (const c of celestialsRef.current) {
-        rows.push({
-          key: c.key,
-          name: c.name,
-          kind: c.kind,
-          distMeters: effectiveDistanceMeters(shipPos, c),
-        });
+        rows.push({ key: c.key, name: c.name, kind: c.kind, distMeters: effectiveDistanceMeters(shipPos, c) });
       }
 
       for (const s of combatSitesRef.current) {
-        rows.push({
-          key: s.key,
-          name: s.name,
-          kind: s.kind,
-          distMeters: effectiveDistanceMeters(shipPos, s),
-        });
+        rows.push({ key: s.key, name: s.name, kind: s.kind, distMeters: effectiveDistanceMeters(shipPos, s) });
       }
 
-      for (const n of npcsRef.current) {
-        rows.push({
-          key: n.key,
-          name: n.name,
-          kind: n.kind,
-          distMeters: effectiveDistanceMeters(shipPos, n),
-        });
+      // NPCs + wrecks only appear within the combat site grid range
+      if (gridActive) {
+        for (const n of npcsRef.current) {
+          rows.push({ key: n.key, name: n.name, kind: n.kind, distMeters: effectiveDistanceMeters(shipPos, n) });
+        }
+        for (const w of wrecksRef.current) {
+          rows.push({ key: w.key, name: w.name, kind: w.kind, distMeters: effectiveDistanceMeters(shipPos, w) });
+        }
       }
 
       rows.sort((a, b) => a.distMeters - b.distMeters);
@@ -1909,7 +2167,7 @@ export default function GameCanvas({ identityHex }: Props) {
 
       for (const h of hits) {
         const meta = spriteMetaRef.current.get(h.object);
-        if (meta) return { meta, object: h.object as THREE.Sprite };
+        if (meta && isEntityVisibleToPlayer(meta)) return { meta, object: h.object as THREE.Sprite };
       }
       return null;
     };
@@ -1980,7 +2238,7 @@ export default function GameCanvas({ identityHex }: Props) {
   const armorPct = Math.max(0, Math.min(1, armor / shipStats.maxArmor));
   const hullPct = Math.max(0, Math.min(1, hull / shipStats.maxHull));
 
-  const speedMaxMps = inWarp ? (WARP_MAX_SPEED / SCALE_FACTOR) : (SUBLIGHT_MAX_SPEED / SCALE_FACTOR);
+  const speedMaxMps = inWarp ? WARP_MAX_SPEED / SCALE_FACTOR : SUBLIGHT_MAX_SPEED / SCALE_FACTOR;
   const speedPct = Math.max(0, Math.min(1, speedMps / Math.max(1, speedMaxMps)));
 
   const ctxLockInfo = useMemo(() => {
@@ -2005,13 +2263,12 @@ export default function GameCanvas({ identityHex }: Props) {
             const meta = findSpaceByKey(k);
             if (!meta) return null;
 
-            const dist = (overviewRows.find((r) => r.key === k)?.distMeters ?? 0);
+            const dist = overviewRows.find((r) => r.key === k)?.distMeters ?? 0;
 
-            // If it's an NPC, prefer live %; otherwise fall back to stored test HP.
             const livePct =
               meta.kind === "npc"
                 ? Math.round((meta.hp / Math.max(1, meta.maxHp)) * 100)
-                : (targetTestHp[k] ?? 100);
+                : targetTestHp[k] ?? 100;
 
             const hpPct = Math.max(0, Math.min(1, livePct / 100));
             const active = activeLockedKey === k;
@@ -2046,7 +2303,7 @@ export default function GameCanvas({ identityHex }: Props) {
         </div>
       )}
 
-      {/* Overview (dense, single-line, type column) */}
+      {/* Overview */}
       <div
         className="god-overview"
         onMouseDown={(e) => e.stopPropagation()}
@@ -2102,9 +2359,7 @@ export default function GameCanvas({ identityHex }: Props) {
           <div
             className="god-context"
             style={{ left: ctxMenu.x, top: ctxMenu.y }}
-            onMouseDown={(e) => {
-              e.stopPropagation();
-            }}
+            onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             onContextMenu={(e) => {
               e.preventDefault();
@@ -2113,60 +2368,82 @@ export default function GameCanvas({ identityHex }: Props) {
           >
             <div className="god-context-title">{ctxMenu.target.name}</div>
 
-            <button
-              className="god-btn"
-              disabled={inWarp}
-              onClick={() => approachTo(ctxMenu.target)}
-              title={inWarp ? "Cannot change course while in warp" : "Approach target"}
-            >
-              Approach
-            </button>
+            {ctxMenu.target.kind === "wreck" ? (
+              <>
+                <button
+                  className="god-btn"
+                  onClick={() => approachTo(ctxMenu.target)}
+                  title="Approach wreck"
+                >
+                  Approach
+                </button>
 
-            <button
-              className="god-btn"
-              disabled={inWarp || ctxMenu.target.kind === "npc"}
-              onClick={() => warpTo(ctxMenu.target)}
-              title={
-                ctxMenu.target.kind === "npc"
-                  ? "Cannot warp to NPCs"
-                  : inWarp
-                    ? "Already in warp"
-                    : "Warp to target"
-              }
-            >
-              Warp
-            </button>
-
-            {!isLocked(ctxMenu.target.key) ? (
-              <button
-                className="god-btn"
-                disabled={!ctxLockInfo?.inRange || !!ctxLockInfo?.atCap}
-                onClick={() => {
-                  ensureLocked(ctxMenu.target.key);
-                  setSelectedKey(ctxMenu.target.key);
-                  setCtxMenu(null);
-                }}
-                title={
-                  ctxLockInfo?.atCap
-                    ? `Max locked targets: ${MAX_LOCKS}`
-                    : !ctxLockInfo?.inRange
-                      ? `Too far to lock (≤ ${formatDistanceMeters(LOCK_RANGE_M)})`
-                      : "Lock target (required to fire)"
-                }
-              >
-                Lock target
-              </button>
+                <button
+                  className="god-btn"
+                  onClick={() => lootAllFromWreck(ctxMenu.target as WreckMeta)}
+                  title="Loot everything from this wreck"
+                >
+                  Loot all
+                </button>
+              </>
             ) : (
-              <button
-                className="god-btn"
-                onClick={() => {
-                  unlockTarget(ctxMenu.target.key);
-                  setCtxMenu(null);
-                }}
-                title="Unlock target"
-              >
-                Unlock target
-              </button>
+              <>
+                <button
+                  className="god-btn"
+                  disabled={inWarp}
+                  onClick={() => approachTo(ctxMenu.target)}
+                  title={inWarp ? "Cannot change course while in warp" : "Approach target"}
+                >
+                  Approach
+                </button>
+
+                <button
+                  className="god-btn"
+                  disabled={inWarp || ctxMenu.target.kind === "npc"}
+                  onClick={() => warpTo(ctxMenu.target)}
+                  title={
+                    ctxMenu.target.kind === "npc"
+                      ? "Cannot warp to NPCs"
+                      : inWarp
+                        ? "Already in warp"
+                        : "Warp to target"
+                  }
+                >
+                  Warp
+                </button>
+
+                {!isLocked(ctxMenu.target.key) ? (
+                  <button
+                    className="god-btn"
+                    disabled={!ctxLockInfo?.inRange || !!ctxLockInfo?.atCap}
+                    onClick={() => {
+                      ensureLocked(ctxMenu.target.key);
+                      setSelectedKey(ctxMenu.target.key);
+                      setCtxMenu(null);
+                    }}
+                    title={
+                      ctxLockInfo?.atCap
+                        ? `Max locked targets: ${MAX_LOCKS}`
+                        : !ctxLockInfo?.inRange
+                          ? `Too far to lock (≤ ${formatDistanceMeters(LOCK_RANGE_M)})`
+                          : "Lock target (required to fire)"
+                    }
+                  >
+                    Lock target
+                  </button>
+                ) : (
+                  <button
+                    className="god-btn"
+                    onClick={() => {
+                      unlockTarget(ctxMenu.target.key);
+                      setCtxMenu(null);
+                    }}
+                    title="Unlock target"
+                  >
+                    Unlock target
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -2227,6 +2504,9 @@ export default function GameCanvas({ identityHex }: Props) {
       <div className="god-corner">
         <div>{systemName}</div>
         <div>{identityHex.slice(0, 8)}</div>
+        <div>
+          CARGO {cargoUsedM3.toFixed(1)}/{shipStats.cargoCapacity_m3.toFixed(0)} m³
+        </div>
       </div>
     </div>
   );

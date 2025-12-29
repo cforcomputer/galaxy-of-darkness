@@ -10,6 +10,9 @@ export type ShipStats = {
   maxArmor: number;
   maxHull: number;
 
+  // Inventory / Cargo
+  cargoCapacity_m3: number;
+
   // Placeholder weapon stats (structure only for now)
   weapon: {
     name: string;
@@ -28,7 +31,9 @@ export const DEFAULT_SHIP_STATS: ShipStats = {
   size_m: 300,
 
   maxArmor: 120,
-  maxHull: 90,
+  maxHull: 9000,
+
+  cargoCapacity_m3: 160,
 
   weapon: {
     name: "Civilian Blaster (stub)",

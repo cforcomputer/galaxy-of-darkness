@@ -303,3 +303,149 @@
   padding: 8px;
   z-index: 70;
 }
+
+.god-root {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.god-canvas {
+  position: absolute;
+  inset: 0;
+}
+
+.god-hud {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 340px;
+  pointer-events: none;
+}
+
+.god-panel {
+  pointer-events: auto;
+  background: rgba(10, 12, 18, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 10px;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+
+.god-title {
+  font-weight: 700;
+  font-size: 14px;
+  margin-bottom: 8px;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.god-muted {
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.god-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.god-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+}
+
+.god-row.is-selected {
+  outline: 2px solid rgba(140, 200, 255, 0.35);
+  background: rgba(140, 200, 255, 0.08);
+}
+
+.god-row-left {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.god-row-name {
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.god-row-sub {
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 11px;
+}
+
+.god-row-right {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.god-actions {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+}
+
+.god-btn {
+  background: rgba(160, 200, 255, 0.12);
+  border: 1px solid rgba(160, 200, 255, 0.20);
+  color: rgba(255, 255, 255, 0.92);
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.god-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.god-context {
+  position: absolute;
+  z-index: 9999;
+  min-width: 180px;
+  background: rgba(10, 12, 18, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 10px;
+  padding: 8px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.50);
+}
+
+.god-context-title {
+  color: rgba(255, 255, 255, 0.92);
+  font-weight: 700;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.god-context-btn {
+  width: 100%;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  color: rgba(255, 255, 255, 0.92);
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  margin-top: 6px;
+}
