@@ -83,14 +83,14 @@ const STAR_FILL_INTENSITY = 1.15;
 const STAR_FILL_DECAY = 0.0;
 
 // ✅ NEW: very soft “global bounce” lights (do NOT wash out)
-const BOUNCE_KEY_INTENSITY = 0.22;  // faint
-const BOUNCE_BACK_INTENSITY = 0.10; // even fainter
+const BOUNCE_KEY_INTENSITY = 0.52;  // faint
+const BOUNCE_BACK_INTENSITY = 0.46; // even fainter
 const BOUNCE_COLOR = 0xbfd6ff;      // cool-ish ambient
 const BOUNCE_BACK_COLOR = 0x221b2a; // subtle warm/dark lift
 
 // Base subtle luminance on bodies (keep subtle; don’t rely on emissive)
-const BODY_BASE_LUMINANCE_PLANET = 0.020;
-const BODY_BASE_LUMINANCE_MOON = 0.012;
+const BODY_BASE_LUMINANCE_PLANET = 0.038;
+const BODY_BASE_LUMINANCE_MOON = 0.032;
 const BODY_BASE_LUMINANCE_STATION = 0.028;
 const BODY_BASE_LUMINANCE_GATE = 0.020;
 
