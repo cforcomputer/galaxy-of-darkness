@@ -17,6 +17,9 @@ import {
 } from "./threeHelpers";
 
 import { DEFAULT_SHIP_STATS } from "./shipConfig";
+import { spawnDefaultCombatSite, computeSiteWarpInWorld } from "./combatSites";
+import { spawnNpcWave, type NpcSpec } from "./npcs";
+
 import "./game.css";
 
 type Props = {
@@ -43,7 +46,6 @@ const WARP_ALIGN_SPEED_FRAC = 0.75; // must be at 75% sublight max before enteri
 const WARP_ALIGN_ANGLE_EPS = THREE.MathUtils.degToRad(3); // degrees from desired dir
 const WARP_ALIGN_MIN_TIME = 0.35; // prevents “instant” warp from standstill
 
-
 // Lock constraints
 const LOCK_RANGE_M = 100_000; // 100 km
 const MAX_LOCKS = 5;
@@ -66,6 +68,8 @@ const CAMERA_MAX_DISTANCE_WARP = 0.0025;
 // Sprite: constant screen size (px)
 const SPRITE_PX_BODY = 14;
 const SPRITE_PX_STAR = 18;
+const SPRITE_PX_SITE = 16;
+const SPRITE_PX_NPC = 16;
 const SPRITE_SCALE_MIN = 0.0000005;
 const SPRITE_SCALE_MAX = 0.5;
 
@@ -115,34 +119,78 @@ const NAV_DIR_SMOOTHING = 1.0; // derived from turn rate (keep 1.0)
 const LAYER_WORLD = 0;
 const LAYER_SHIP = 1;
 
+// Tracer (gun line)
+const TRACER_TTL_S = 0.11;
+const TRACER_INTENSITY = 6.0;
+
+// NPC visuals
+const NPC_SPHERE_RADIUS_M = 350; // optional red sphere size
+const NPC_SPHERE_RADIUS_WORLD = NPC_SPHERE_RADIUS_M * SCALE_FACTOR;
+
+// Encounter
+const ENCOUNTER_WAVE_DELAY_MS = 1200;
+
+type SpaceKind = Celestial["kind"] | "combat_site" | "npc";
+
 type CelestialMeta = Celestial & {
   radiusWorld: number;
   key: string;
+  posWorld: THREE.Vector3;
   warpInWorld: THREE.Vector3;
 };
+
+type CombatSiteMeta = {
+  key: string;
+  kind: "combat_site";
+  name: string;
+  posWorld: THREE.Vector3;
+};
+
+type NpcMeta = {
+  key: string;
+  kind: "npc";
+  name: string;
+  posWorld: THREE.Vector3;
+
+  hp: number;
+  maxHp: number;
+
+  wave: number;
+  spec: NpcSpec;
+
+  nextFireAt: number;
+  strafeDir: THREE.Vector3;
+
+  mesh: THREE.Mesh;
+  sprite: THREE.Sprite;
+};
+
+type SpaceMeta = CelestialMeta | CombatSiteMeta | NpcMeta;
 
 type OverviewRow = {
   key: string;
   name: string;
-  kind: Celestial["kind"];
+  kind: SpaceKind;
   distMeters: number;
 };
 
-const KIND_LABEL: Record<Celestial["kind"], string> = {
+const KIND_LABEL: Record<SpaceKind, string> = {
   star: "STAR",
   planet: "PLANET",
   moon: "MOON",
   stargate: "GATE",
   station: "STATION",
+  combat_site: "COMBAT",
+  npc: "NPC",
 };
 
-function makeCelestialSpriteTexture(kind: Celestial["kind"]) {
+function makeMarkerTexture(kind: SpaceKind) {
   const canvas = document.createElement("canvas");
   canvas.width = 64;
   canvas.height = 64;
   const ctx = canvas.getContext("2d")!;
 
-  const fill =
+  let fill =
     kind === "star"
       ? "#FFD27D"
       : kind === "planet"
@@ -151,7 +199,11 @@ function makeCelestialSpriteTexture(kind: Celestial["kind"]) {
           ? "#B0B0B0"
           : kind === "stargate"
             ? "#33B6FF"
-            : "#FF4CF0";
+            : kind === "station"
+              ? "#FF4CF0"
+              : kind === "combat_site"
+                ? "#FFC94A"
+                : "#FF3B3B"; // npc
 
   ctx.clearRect(0, 0, 64, 64);
 
@@ -163,16 +215,30 @@ function makeCelestialSpriteTexture(kind: Celestial["kind"]) {
   ctx.arc(32, 32, 28, 0, Math.PI * 2);
   ctx.fill();
 
+  // inner dot
   ctx.fillStyle = fill;
   ctx.beginPath();
   ctx.arc(32, 32, 8.5, 0, Math.PI * 2);
   ctx.fill();
 
+  // ring
   ctx.strokeStyle = "rgba(255,255,255,0.85)";
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.arc(32, 32, 10.5, 0, Math.PI * 2);
   ctx.stroke();
+
+  // NPC cross
+  if (kind === "npc") {
+    ctx.strokeStyle = "rgba(255,70,70,0.95)";
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(18, 18);
+    ctx.lineTo(46, 46);
+    ctx.moveTo(46, 18);
+    ctx.lineTo(18, 46);
+    ctx.stroke();
+  }
 
   const tex = new THREE.CanvasTexture(canvas);
   tex.anisotropy = 4;
@@ -188,52 +254,50 @@ function radiusMetersToWorld(kind: Celestial["kind"], radius_m?: number) {
   return r * SCALE_FACTOR;
 }
 
-function effectiveDistanceMeters(shipPosWorld: THREE.Vector3, meta: CelestialMeta) {
-  const centerPosWorld = mToWorld(meta.position_m);
-  const centerDistMeters = shipPosWorld.distanceTo(centerPosWorld) / SCALE_FACTOR;
-  if (meta.kind === "star") return centerDistMeters;
+function centerDistanceMeters(shipPosWorld: THREE.Vector3, posWorld: THREE.Vector3) {
+  return shipPosWorld.distanceTo(posWorld) / SCALE_FACTOR;
+}
 
-  const radiusMeters = meta.radiusWorld / SCALE_FACTOR;
+// For overview: show surface-ish distance for big bodies (except star)
+function effectiveDistanceMeters(shipPosWorld: THREE.Vector3, meta: SpaceMeta) {
+  const centerDistMeters = shipPosWorld.distanceTo(meta.posWorld) / SCALE_FACTOR;
+  if (meta.kind === "star" || meta.kind === "combat_site" || meta.kind === "npc") return centerDistMeters;
+
+  const c = meta as CelestialMeta;
+  const radiusMeters = c.radiusWorld / SCALE_FACTOR;
   const adjusted = centerDistMeters - (radiusMeters + WARP_IN_BUFFER_M);
   return Math.max(0, adjusted);
 }
 
+// ✅ Warp-in points should be on the sun-facing (lit) side of the body, most of the time.
 function computeFixedWarpInWorld(
   starPosWorld: THREE.Vector3,
   bodyPosWorld: THREE.Vector3,
   bodyRadiusWorld: number
 ) {
-  const dir = bodyPosWorld.clone().sub(starPosWorld);
-  if (dir.lengthSq() < 1e-12) dir.set(1, 0, 0);
-  else dir.normalize();
+  // Direction from body toward star = sun-facing direction
+  const dirToStar = starPosWorld.clone().sub(bodyPosWorld);
+  if (dirToStar.lengthSq() < 1e-12) dirToStar.set(1, 0, 0);
+  else dirToStar.normalize();
 
   const offsetWorld = bodyRadiusWorld + WARP_IN_BUFFER_M * SCALE_FACTOR;
-  return bodyPosWorld.clone().add(dir.multiplyScalar(offsetWorld));
+  return bodyPosWorld.clone().add(dirToStar.multiplyScalar(offsetWorld));
 }
 
-// Segment-sphere intersection (ship shadow test)
+// More numerically-stable segment-sphere test
 function segmentIntersectsSphere(
   a: THREE.Vector3,
   b: THREE.Vector3,
   center: THREE.Vector3,
   radius: number
 ): boolean {
-  const d = b.clone().sub(a);
-  const f = a.clone().sub(center);
+  const ab = b.clone().sub(a);
+  const abLenSq = ab.lengthSq();
+  if (abLenSq < 1e-16) return a.distanceTo(center) <= radius;
 
-  const A = d.dot(d);
-  const B = 2 * f.dot(d);
-  const C = f.dot(f) - radius * radius;
-
-  const disc = B * B - 4 * A * C;
-  if (disc < 0) return false;
-
-  const sqrt = Math.sqrt(disc);
-  const t1 = (-B - sqrt) / (2 * A);
-  const t2 = (-B + sqrt) / (2 * A);
-
-  // any intersection within segment
-  return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1);
+  const t = THREE.MathUtils.clamp(center.clone().sub(a).dot(ab) / abLenSq, 0, 1);
+  const closest = a.clone().add(ab.multiplyScalar(t));
+  return closest.distanceTo(center) <= radius;
 }
 
 const AU_METERS = 149_597_870_700; // 1 AU in meters
@@ -246,13 +310,11 @@ function formatSpeed(mps: number, unit: "mps" | "aups") {
     return `${aups.toFixed(2)} AU/s`;
   }
 
-  // m/s / km/s formatting
   const abs = Math.abs(mps);
   if (abs >= 10_000) return `${(mps / 1000).toFixed(1)} km/s`;
   if (abs >= 1000) return `${mps.toFixed(0)} m/s`;
   return `${mps.toFixed(0)} m/s`;
 }
-
 
 // --- Sky ----------------------------------------------------------------------
 
@@ -447,9 +509,7 @@ export default function GameCanvas({ identityHex }: Props) {
 
   const starPosWorldRef = useRef(new THREE.Vector3(0, 0, 0));
 
-  const skyRef = useRef<{ mesh: THREE.Mesh; mat: THREE.ShaderMaterial } | null>(
-    null
-  );
+  const skyRef = useRef<{ mesh: THREE.Mesh; mat: THREE.ShaderMaterial } | null>(null);
 
   const warpTunnelRef = useRef<{
     mesh: THREE.Mesh;
@@ -462,10 +522,7 @@ export default function GameCanvas({ identityHex }: Props) {
     mat: THREE.ShaderMaterial;
   } | null>(null);
 
-  const warpFlashRef = useRef<{
-    mesh: THREE.Mesh;
-    mat: THREE.ShaderMaterial;
-  } | null>(null);
+  const warpFlashRef = useRef<{ mesh: THREE.Mesh; mat: THREE.ShaderMaterial } | null>(null);
   const warpExitFlashRef = useRef<number>(0);
 
   const sublightDirRef = useRef<THREE.Vector3 | null>(null);
@@ -478,23 +535,28 @@ export default function GameCanvas({ identityHex }: Props) {
   } | null>(null);
 
   const warpRef = useRef<{
-  active: boolean;
-  phase: "align" | "warp";
-  destPos: THREE.Vector3;
-  centerPos: THREE.Vector3;
-  targetName: string;
-  targetKey: string;
-  alignTime: number;
-} | null>(null);
+    active: boolean;
+    phase: "align" | "warp";
+    destPos: THREE.Vector3;
+    centerPos: THREE.Vector3;
+    targetName: string;
+    targetKey: string;
+    alignTime: number;
+  } | null>(null);
 
-
-  const spriteMetaRef = useRef<Map<THREE.Object3D, CelestialMeta>>(new Map());
+  // Markers for picking (celestials + sites + npc markers)
+  const spriteMetaRef = useRef<Map<THREE.Object3D, SpaceMeta>>(new Map());
   const spritesRef = useRef<THREE.Sprite[]>([]);
-  const spriteMatsRef = useRef<Map<THREE.Sprite, THREE.SpriteMaterial>>(
-    new Map()
-  );
+  const spriteMatsRef = useRef<Map<THREE.Sprite, THREE.SpriteMaterial>>(new Map());
 
   const celestialsRef = useRef<CelestialMeta[]>([]);
+  const combatSitesRef = useRef<CombatSiteMeta[]>([]);
+  const npcsRef = useRef<NpcMeta[]>([]);
+
+  const encounterRef = useRef<{ siteKey: string; wave: 0 | 1 | 2 | 3; nextWaveAt: number } | null>(null);
+
+  // Tracers
+  const tracersRef = useRef<Array<{ line: THREE.Line; born: number; ttl: number }>>([]);
 
   // Bounce lights refs so we can update their direction after ESI load
   const bounceKeyRef = useRef<THREE.DirectionalLight | null>(null);
@@ -512,13 +574,16 @@ export default function GameCanvas({ identityHex }: Props) {
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
     y: number;
-    celestial: CelestialMeta;
+    target: SpaceMeta;
   } | null>(null);
 
   const shipStats = DEFAULT_SHIP_STATS;
 
   const [armor, setArmor] = useState(shipStats.maxArmor);
   const [hull, setHull] = useState(shipStats.maxHull);
+
+  const armorRef = useRef(shipStats.maxArmor);
+  const hullRef = useRef(shipStats.maxHull);
 
   const [speedMps, setSpeedMps] = useState(0);
 
@@ -530,6 +595,7 @@ export default function GameCanvas({ identityHex }: Props) {
   const [activeLockedKey, setActiveLockedKey] = useState<string | null>(null);
   const activeLockedKeyRef = useRef<string | null>(null);
 
+  // 0..100 hp display for locked UI (celestials can stay 100; NPCs update)
   const [targetTestHp, setTargetTestHp] = useState<Record<string, number>>({});
   const targetTestHpRef = useRef<Record<string, number>>({});
 
@@ -559,23 +625,33 @@ export default function GameCanvas({ identityHex }: Props) {
     firingRef.current = firing;
   }, [firing]);
 
-  const findCelestialByKey = (key: string | null): CelestialMeta | null => {
+  useEffect(() => {
+    armorRef.current = armor;
+  }, [armor]);
+
+  useEffect(() => {
+    hullRef.current = hull;
+  }, [hull]);
+
+  const findSpaceByKey = (key: string | null): SpaceMeta | null => {
     if (!key) return null;
-    const list = celestialsRef.current;
-    for (const c of list) if (c.key === key) return c;
+
+    for (const n of npcsRef.current) if (n.key === key) return n;
+    for (const s of combatSitesRef.current) if (s.key === key) return s;
+    for (const c of celestialsRef.current) if (c.key === key) return c;
+
     return null;
   };
 
-  const canLockNow = (meta: CelestialMeta) => {
+  const canLockNow = (meta: SpaceMeta) => {
     const shipPos = shipPosRef.current;
     const d = effectiveDistanceMeters(shipPos, meta);
     return d <= LOCK_RANGE_M;
   };
 
   const ensureLocked = (key: string) => {
-    const meta = findCelestialByKey(key);
+    const meta = findSpaceByKey(key);
     if (!meta) return;
-
     if (!canLockNow(meta)) return;
 
     setLockedKeys((prev) => {
@@ -584,7 +660,16 @@ export default function GameCanvas({ identityHex }: Props) {
       return [...prev, key];
     });
 
-    setTargetTestHp((prev) => (prev[key] == null ? { ...prev, [key]: 100 } : prev));
+    // initialize hp bar
+    setTargetTestHp((prev) => {
+      if (prev[key] != null) return prev;
+      if (meta.kind === "npc") {
+        const pct = Math.round((meta.hp / Math.max(1, meta.maxHp)) * 100);
+        return { ...prev, [key]: pct };
+      }
+      return { ...prev, [key]: 100 };
+    });
+
     setActiveLockedKey((prev) => prev ?? key);
   };
 
@@ -617,43 +702,45 @@ export default function GameCanvas({ identityHex }: Props) {
     setFiring((v) => !v);
   };
 
-  const approachTo = (c: CelestialMeta) => {
+  const approachTo = (m: SpaceMeta) => {
     if (warpRef.current?.active) return;
-    setSelectedKey(c.key);
+    setSelectedKey(m.key);
     approachRef.current = {
       active: true,
-      targetPos: mToWorld(c.position_m),
-      targetRadius: c.radiusWorld,
-      targetKey: c.key,
+      targetPos: m.posWorld.clone(),
+      targetRadius: (m as any).radiusWorld ?? 0,
+      targetKey: m.key,
     };
     sublightDirRef.current = null;
     setCtxMenu(null);
   };
 
-  const warpTo = (c: CelestialMeta) => {
-  if (warpRef.current?.active) return;
+  const warpTo = (m: SpaceMeta) => {
+    if (warpRef.current?.active) return;
+    if (m.kind === "npc") return; // no warp-to NPCs for now
 
-  approachRef.current = null;
-  sublightDirRef.current = null;
+    approachRef.current = null;
+    sublightDirRef.current = null;
 
-  const dest = c.warpInWorld.clone();
-  const center = mToWorld(c.position_m);
+    const shipPos = shipPosRef.current.clone();
 
-  warpRef.current = {
-    active: true,
-    phase: "align",
-    destPos: dest,
-    centerPos: center,
-    targetName: c.name,
-    targetKey: c.key,
-    alignTime: 0,
+    const dest =
+      m.kind === "combat_site"
+        ? computeSiteWarpInWorld(shipPos, m.posWorld)
+        : (m as CelestialMeta).warpInWorld.clone();
+
+    warpRef.current = {
+      active: true,
+      phase: "align",
+      destPos: dest,
+      centerPos: m.posWorld.clone(),
+      targetName: m.name,
+      targetKey: m.key,
+      alignTime: 0,
+    };
+
+    setCtxMenu(null);
   };
-
-  // Do NOT snap facing or velocity here.
-  // Alignment happens gradually in the movement step.
-  setCtxMenu(null);
-};
-
 
   useEffect(() => {
     const host = canvasHostRef.current;
@@ -671,7 +758,6 @@ export default function GameCanvas({ identityHex }: Props) {
       1_000_000_000
     );
 
-    // IMPORTANT: camera must render both world + ship layers
     camera.layers.enable(LAYER_SHIP);
 
     camera.position.set(0.00003, 0.000012, 0.00003);
@@ -728,12 +814,12 @@ export default function GameCanvas({ identityHex }: Props) {
     hemi.layers.enable(LAYER_SHIP);
     scene.add(hemi);
 
-    // Bounce lights should affect both world and ship
+    // Bounce lights should affect both world and ship (persistent; do NOT delete on system rebuild)
     const bounceKey = new THREE.DirectionalLight(BOUNCE_COLOR, BOUNCE_KEY_INTENSITY);
     bounceKey.position.set(1, 1, 1);
     bounceKey.target.position.set(0, 0, 0);
     bounceKey.castShadow = false;
-    bounceKey.userData.godCelestial = true;
+    bounceKey.userData.godPersistent = true;
     bounceKey.layers.enable(LAYER_SHIP);
     scene.add(bounceKey);
     scene.add(bounceKey.target);
@@ -743,7 +829,7 @@ export default function GameCanvas({ identityHex }: Props) {
     bounceBack.position.set(-1, -1, -1);
     bounceBack.target.position.set(0, 0, 0);
     bounceBack.castShadow = false;
-    bounceBack.userData.godCelestial = true;
+    bounceBack.userData.godPersistent = true;
     bounceBack.layers.enable(LAYER_SHIP);
     scene.add(bounceBack);
     scene.add(bounceBack.target);
@@ -797,11 +883,111 @@ export default function GameCanvas({ identityHex }: Props) {
     window.addEventListener("resize", onResize);
 
     const tmp = new THREE.Vector3();
-    const tmp2 = new THREE.Vector3();
     const q = new THREE.Quaternion();
     const baseAxis = new THREE.Vector3(0, 0, 1);
 
-    const performShot = (targetKey: string) => {
+    const spawnTracer = (fromWorld: THREE.Vector3, toWorld: THREE.Vector3) => {
+      const sc = sceneRef.current;
+      if (!sc) return;
+
+      const geom = new THREE.BufferGeometry().setFromPoints([fromWorld.clone(), toWorld.clone()]);
+      const mat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(TRACER_INTENSITY, TRACER_INTENSITY, TRACER_INTENSITY),
+        transparent: true,
+        opacity: 1,
+      });
+      (mat as any).toneMapped = false;
+
+      const line = new THREE.Line(geom, mat);
+      line.layers.set(LAYER_WORLD);
+      line.renderOrder = 9500;
+      line.userData.godSystem = true;
+
+      sc.add(line);
+      tracersRef.current.push({ line, born: performance.now(), ttl: TRACER_TTL_S });
+    };
+
+    const applyDamageToPlayer = (dmgArmor: number, dmgHull: number) => {
+      let a = armorRef.current;
+      let h = hullRef.current;
+
+      // armor first
+      const armorTaken = Math.min(a, dmgArmor);
+      a -= armorTaken;
+
+      // overflow armor damage to hull
+      const overflow = dmgArmor - armorTaken;
+      const hullFromOverflow = Math.max(0, overflow);
+
+      h -= hullFromOverflow;
+      h -= dmgHull;
+
+      a = Math.max(0, a);
+      h = Math.max(0, h);
+
+      armorRef.current = a;
+      hullRef.current = h;
+      setArmor(a);
+      setHull(h);
+
+      if (h <= 0) {
+        // Player “dies” -> respawn where it died (no teleport for now)
+        armorRef.current = shipStats.maxArmor;
+        hullRef.current = shipStats.maxHull;
+        setArmor(shipStats.maxArmor);
+        setHull(shipStats.maxHull);
+
+        shipVelRef.current.set(0, 0, 0);
+        sublightDirRef.current = null;
+        approachRef.current = null;
+        warpRef.current = null;
+        setFiring(false);
+        firingRef.current = false;
+      }
+    };
+
+    const killNpc = (npc: NpcMeta) => {
+      // remove visuals
+      npc.mesh.removeFromParent();
+      npc.sprite.removeFromParent();
+      safeDispose(npc.mesh);
+      if (npc.sprite.material) (npc.sprite.material as any).dispose?.();
+
+      // remove from selection arrays
+      spritesRef.current = spritesRef.current.filter((s) => s !== npc.sprite);
+      spriteMatsRef.current.delete(npc.sprite);
+      spriteMetaRef.current.delete(npc.sprite);
+
+      // remove from npc list
+      npcsRef.current = npcsRef.current.filter((n) => n.key !== npc.key);
+
+      // if locked, unlock
+      if (lockedKeysRef.current.includes(npc.key)) unlockTarget(npc.key);
+    };
+
+    const damageNpc = (npc: NpcMeta, dmg: number) => {
+      npc.hp = Math.max(0, npc.hp - dmg);
+      if (targetTestHpRef.current[npc.key] != null) {
+        const pct = Math.round((npc.hp / Math.max(1, npc.maxHp)) * 100);
+        setTargetTestHp((prev) => ({ ...prev, [npc.key]: pct }));
+      }
+      if (npc.hp <= 0) killNpc(npc);
+    };
+
+    const performShot = (targetKey: string, originWorld: THREE.Vector3) => {
+      const meta = findSpaceByKey(targetKey);
+      if (!meta) return;
+
+      spawnTracer(originWorld, meta.posWorld);
+
+      // If NPC: actually damage it
+      if (meta.kind === "npc") {
+        const dmg = shipStats.weapon.damage.armor + shipStats.weapon.damage.hull;
+        damageNpc(meta, dmg);
+        return;
+      }
+
+      // Otherwise: keep your old “test hp” behavior
       setTargetTestHp((prev) => {
         const cur = prev[targetKey] ?? 100;
         const next = Math.max(0, cur - 5);
@@ -827,11 +1013,133 @@ export default function GameCanvas({ identityHex }: Props) {
       return nav;
     };
 
+    const stepEncounter = (nowMs: number) => {
+      const enc = encounterRef.current;
+      if (!enc) return;
+
+      const alive = npcsRef.current.length;
+      if (alive > 0) return;
+
+      if (nowMs < enc.nextWaveAt) return;
+
+      if (enc.wave >= 3) return;
+
+      const nextWave = (enc.wave + 1) as 1 | 2 | 3;
+      enc.wave = nextWave;
+      enc.nextWaveAt = nowMs + ENCOUNTER_WAVE_DELAY_MS;
+
+      const sc = sceneRef.current;
+      if (!sc) return;
+
+      const site = combatSitesRef.current.find((s) => s.key === enc.siteKey);
+      if (!site) return;
+
+      const spawned = spawnNpcWave(site.posWorld, nextWave);
+
+      for (const sp of spawned) {
+        // sphere
+        const npcMat = new THREE.MeshStandardMaterial({
+          color: 0xff2a2a,
+          emissive: new THREE.Color(0xff0000),
+          emissiveIntensity: 1.2,
+          roughness: 0.6,
+          metalness: 0.0,
+        });
+
+        const npcMesh = new THREE.Mesh(
+          new THREE.SphereGeometry(NPC_SPHERE_RADIUS_WORLD, 14, 12),
+          npcMat
+        );
+        npcMesh.position.copy(sp.posWorld);
+        npcMesh.layers.set(LAYER_WORLD);
+        npcMesh.userData.godSystem = true;
+        sc.add(npcMesh);
+
+        // marker sprite (red cross)
+        const tex = makeMarkerTexture("npc");
+        const smat = new THREE.SpriteMaterial({
+          map: tex,
+          transparent: true,
+          opacity: 0.95,
+          depthWrite: false,
+          depthTest: true,
+        });
+        const sprite = new THREE.Sprite(smat);
+        sprite.position.copy(sp.posWorld);
+        sprite.layers.set(LAYER_WORLD);
+        sprite.userData.godSystem = true;
+        sc.add(sprite);
+
+        const meta: NpcMeta = {
+          key: sp.key,
+          kind: "npc",
+          name: sp.name,
+          posWorld: sp.posWorld,
+          hp: sp.hp,
+          maxHp: sp.spec.maxHp,
+          wave: nextWave,
+          spec: sp.spec,
+          nextFireAt: sp.nextFireAt,
+          strafeDir: sp.strafeDir,
+          mesh: npcMesh,
+          sprite,
+        };
+
+        npcsRef.current.push(meta);
+        spritesRef.current.push(sprite);
+        spriteMatsRef.current.set(sprite, smat);
+        spriteMetaRef.current.set(sprite, meta);
+      }
+    };
+
+    const stepNpcs = (dt: number) => {
+      const now = performance.now();
+      const shipPos = shipPosRef.current;
+
+      for (const npc of npcsRef.current) {
+        // Maintain range ~5km with some strafe
+        const toShip = shipPos.clone().sub(npc.posWorld);
+        const distWorld = toShip.length();
+        const distM = distWorld / SCALE_FACTOR;
+
+        const desiredWorld = npc.spec.desiredRange_m * SCALE_FACTOR;
+        const bandWorld = 600 * SCALE_FACTOR; // +/- 0.6km
+
+        let moveDir = new THREE.Vector3();
+        if (distWorld < desiredWorld - bandWorld) {
+          moveDir.copy(toShip.normalize()).multiplyScalar(-1); // too close -> move away
+          moveDir.lerp(npc.strafeDir, 0.25);
+        } else if (distWorld > desiredWorld + bandWorld) {
+          moveDir.copy(toShip.normalize()); // too far -> move closer
+          moveDir.lerp(npc.strafeDir, 0.18);
+        } else {
+          moveDir.copy(npc.strafeDir); // in band -> strafe
+        }
+
+        if (moveDir.lengthSq() < 1e-12) moveDir.set(1, 0, 0);
+        else moveDir.normalize();
+
+        const speedWorld = npc.spec.speed_mps * SCALE_FACTOR;
+        npc.posWorld.addScaledVector(moveDir, speedWorld * dt);
+
+        npc.mesh.position.copy(npc.posWorld);
+        npc.sprite.position.copy(npc.posWorld);
+
+        // Fire if in range
+        if (distM <= npc.spec.range_m && now >= npc.nextFireAt) {
+          npc.nextFireAt = now + npc.spec.cooldownMs;
+
+          spawnTracer(npc.posWorld, shipPos);
+          applyDamageToPlayer(npc.spec.damage.armor, npc.spec.damage.hull);
+        }
+      }
+    };
+
     const stepMovement = (dt: number) => {
       const shipPos = shipPosRef.current;
       const shipVel = shipVelRef.current;
 
-      // auto-firing loop
+      // auto-firing loop (player)
       if (firingRef.current) {
         const active = activeLockedKeyRef.current;
         if (!active) {
@@ -844,11 +1152,11 @@ export default function GameCanvas({ identityHex }: Props) {
               firingRef.current = false;
               setFiring(false);
             } else {
-              const meta = findCelestialByKey(active);
+              const meta = findSpaceByKey(active);
               if (meta) {
-                const distMeters = effectiveDistanceMeters(shipPos, meta);
+                const distMeters = centerDistanceMeters(shipPos, meta.posWorld);
                 if (distMeters <= shipStats.weapon.range_m) {
-                  performShot(active);
+                  performShot(active, shipPos.clone());
                 }
               }
               nextFireAtRef.current = now + shipStats.weapon.cooldownMs;
@@ -858,92 +1166,86 @@ export default function GameCanvas({ identityHex }: Props) {
       }
 
       // warp (two-phase: align -> warp)
-const warp = warpRef.current;
-if (warp?.active) {
-  const toDest = warp.destPos.clone().sub(shipPos);
-  const dist = toDest.length();
+      const warp = warpRef.current;
+      if (warp?.active) {
+        const toDest = warp.destPos.clone().sub(shipPos);
+        const dist = toDest.length();
 
-  const stopDist = Math.max(shipStats.size_m * SCALE_FACTOR * 10, 1e-7);
+        const stopDist = Math.max(shipStats.size_m * SCALE_FACTOR * 10, 1e-7);
 
-  // If we're basically at destination (edge case), finish immediately.
-  if (dist <= stopDist) {
-    shipPos.copy(warp.destPos);
-    shipVel.set(0, 0, 0);
-    warpExitFlashRef.current = 1.0;
-    warpRef.current = null;
-    return;
-  }
+        if (dist <= stopDist) {
+          shipPos.copy(warp.destPos);
+          shipVel.set(0, 0, 0);
+          warpExitFlashRef.current = 1.0;
+          warpRef.current = null;
+          return;
+        }
 
-  const desired = toDest.normalize();
+        const desired = toDest.normalize();
 
-  // --- PHASE 1: ALIGN ---
-  if (warp.phase === "align") {
-    warp.alignTime += dt;
+        // --- PHASE 1: ALIGN ---
+        if (warp.phase === "align") {
+          warp.alignTime += dt;
 
-    // Gradually rotate toward desired
-    const nav = updateNavDirection(desired.clone(), dt);
-    shipForwardRef.current.copy(nav);
+          const nav = updateNavDirection(desired.clone(), dt);
+          shipForwardRef.current.copy(nav);
 
-    // Spool up to 75% of sublight max
-    const alignSpeed = SUBLIGHT_MAX_SPEED * WARP_ALIGN_SPEED_FRAC;
+          const alignSpeed = SUBLIGHT_MAX_SPEED * WARP_ALIGN_SPEED_FRAC;
 
-    const v = shipVel.length();
-    let newSpeed = v;
+          const v = shipVel.length();
+          let newSpeed = v;
 
-    if (v < alignSpeed) newSpeed = Math.min(alignSpeed, v + SUBLIGHT_ACCEL * dt);
-    else newSpeed = Math.max(alignSpeed, v - SUBLIGHT_DECEL * dt);
+          if (v < alignSpeed) newSpeed = Math.min(alignSpeed, v + SUBLIGHT_ACCEL * dt);
+          else newSpeed = Math.max(alignSpeed, v - SUBLIGHT_DECEL * dt);
 
-    shipVel.copy(nav.clone().multiplyScalar(newSpeed));
-    shipPos.addScaledVector(shipVel, dt);
+          shipVel.copy(nav.clone().multiplyScalar(newSpeed));
+          shipPos.addScaledVector(shipVel, dt);
 
-    const angle = nav.angleTo(desired);
-    const speedOk = newSpeed >= alignSpeed * 0.98;
-    const angleOk = angle <= WARP_ALIGN_ANGLE_EPS;
-    const timeOk = warp.alignTime >= WARP_ALIGN_MIN_TIME;
+          const angle = nav.angleTo(desired);
+          const speedOk = newSpeed >= alignSpeed * 0.98;
+          const angleOk = angle <= WARP_ALIGN_ANGLE_EPS;
+          const timeOk = warp.alignTime >= WARP_ALIGN_MIN_TIME;
 
-    if (angleOk && speedOk && timeOk) {
-      // Enter warp
-      warp.phase = "warp";
-      navDirRef.current.copy(desired);
-      shipForwardRef.current.copy(desired);
+          if (angleOk && speedOk && timeOk) {
+            warp.phase = "warp";
+            navDirRef.current.copy(desired);
+            shipForwardRef.current.copy(desired);
 
-      const startWarpSpeed = Math.max(WARP_MIN_SPEED, shipVel.length());
-      shipVel.copy(desired.clone().multiplyScalar(startWarpSpeed));
-    }
+            const startWarpSpeed = Math.max(WARP_MIN_SPEED, shipVel.length());
+            shipVel.copy(desired.clone().multiplyScalar(startWarpSpeed));
+          }
 
-    return;
-  }
+          return;
+        }
 
-  // --- PHASE 2: WARP ---
-  // Warp direction is fixed
-  navDirRef.current.copy(desired);
-  shipForwardRef.current.copy(desired);
+        // --- PHASE 2: WARP ---
+        navDirRef.current.copy(desired);
+        shipForwardRef.current.copy(desired);
 
-  const remaining = Math.max(1e-7, dist - stopDist);
-  const v = shipVel.length();
-  const requiredDecel = (v * v) / (2 * remaining);
+        const remaining = Math.max(1e-7, dist - stopDist);
+        const v = shipVel.length();
+        const requiredDecel = (v * v) / (2 * remaining);
 
-  let newSpeed = v;
-  if (requiredDecel > WARP_DECEL * 0.92) {
-    newSpeed = Math.max(0, v - WARP_DECEL * dt);
-  } else {
-    newSpeed = Math.min(WARP_MAX_SPEED, v + WARP_ACCEL * dt);
-  }
-  if (newSpeed > 0) newSpeed = Math.max(newSpeed, WARP_MIN_SPEED);
+        let newSpeed = v;
+        if (requiredDecel > WARP_DECEL * 0.92) {
+          newSpeed = Math.max(0, v - WARP_DECEL * dt);
+        } else {
+          newSpeed = Math.min(WARP_MAX_SPEED, v + WARP_ACCEL * dt);
+        }
+        if (newSpeed > 0) newSpeed = Math.max(newSpeed, WARP_MIN_SPEED);
 
-  shipVel.copy(desired.clone().multiplyScalar(newSpeed));
-  shipPos.addScaledVector(shipVel, dt);
+        shipVel.copy(desired.clone().multiplyScalar(newSpeed));
+        shipPos.addScaledVector(shipVel, dt);
 
-  const after = warp.destPos.clone().sub(shipPos);
-  if (after.dot(desired) < 0) {
-    shipPos.copy(warp.destPos);
-    shipVel.set(0, 0, 0);
-    warpExitFlashRef.current = 1.0;
-    warpRef.current = null;
-  }
-  return;
-}
-
+        const after = warp.destPos.clone().sub(shipPos);
+        if (after.dot(desired) < 0) {
+          shipPos.copy(warp.destPos);
+          shipVel.set(0, 0, 0);
+          warpExitFlashRef.current = 1.0;
+          warpRef.current = null;
+        }
+        return;
+      }
 
       // approach mode
       const approach = approachRef.current;
@@ -977,7 +1279,6 @@ if (warp?.active) {
           newSpeed = Math.min(SUBLIGHT_MAX_SPEED, v + SUBLIGHT_ACCEL * dt);
         }
 
-        // velocity direction follows the gradually-aligning nav dir
         shipVel.copy(nav.clone().multiplyScalar(newSpeed));
         shipPos.addScaledVector(shipVel, dt);
         return;
@@ -1028,6 +1329,10 @@ if (warp?.active) {
 
       if (!cam || !ctrl || !comp || !shipObj) return;
 
+      // encounter + npc AI
+      stepEncounter(performance.now());
+      stepNpcs(dt);
+
       stepMovement(dt);
 
       if (skyObj) skyObj.mat.uniforms.uTime.value += dt;
@@ -1054,14 +1359,10 @@ if (warp?.active) {
       const camToTarget = new THREE.Vector3().copy(cam.position).sub(ctrl.target);
       const camDist = camToTarget.length();
       if (camDist > ctrl.maxDistance) {
-        cam.position.copy(
-          ctrl.target.clone().add(camToTarget.multiplyScalar(ctrl.maxDistance / camDist))
-        );
+        cam.position.copy(ctrl.target.clone().add(camToTarget.multiplyScalar(ctrl.maxDistance / camDist)));
       }
       if (camDist < ctrl.minDistance) {
-        cam.position.copy(
-          ctrl.target.clone().add(camToTarget.normalize().multiplyScalar(ctrl.minDistance))
-        );
+        cam.position.copy(ctrl.target.clone().add(camToTarget.normalize().multiplyScalar(ctrl.minDistance)));
       }
 
       // sprites constant screen-size scaling
@@ -1077,7 +1378,14 @@ if (warp?.active) {
         if (!meta) continue;
 
         const d = s.position.distanceTo(cam.position);
-        const desiredPx = meta.kind === "star" ? SPRITE_PX_STAR : SPRITE_PX_BODY;
+        const desiredPx =
+          meta.kind === "star"
+            ? SPRITE_PX_STAR
+            : meta.kind === "combat_site"
+              ? SPRITE_PX_SITE
+              : meta.kind === "npc"
+                ? SPRITE_PX_NPC
+                : SPRITE_PX_BODY;
 
         const worldSize = pxToWorldAtDist(d) * desiredPx;
         const size = THREE.MathUtils.clamp(worldSize, SPRITE_SCALE_MIN, SPRITE_SCALE_MAX);
@@ -1092,33 +1400,57 @@ if (warp?.active) {
       }
 
       // --- Ship sunlight occlusion (shadow) ---
-      // World star lights keep illuminating planets normally (layer 0).
-      // Ship has its own star lights (layer 1) and we dim them if a planet/moon blocks line-of-sight.
+      // Dim ship-only star lights if planets/moons block star->ship line-of-sight.
       const shipStar = shipStarLightsRef.current;
       if (shipStar) {
         const starPos = starPosWorldRef.current;
         let occluded = false;
 
-        // Only planets/moons can occlude ship sunlight
         const bodies = celestialsRef.current;
         for (const c of bodies) {
           if (c.kind !== "planet" && c.kind !== "moon") continue;
-          const center = mToWorld(c.position_m);
-          const r = c.radiusWorld * 1.02; // slight expansion to make shadows feel “real”
+
+          const center = c.posWorld;
+          const r = c.radiusWorld * 1.02;
+
           if (segmentIntersectsSphere(starPos, newShipPos, center, r)) {
             occluded = true;
             break;
           }
         }
 
-        const targetMult = occluded ? 0.06 : 1.0; // in shadow: almost no direct sunlight
+        // darker in shadow (this was previously too bright)
+        const targetMult = occluded ? 0.012 : 1.0;
         const current = shipShadowMultRef.current;
-        const lerp = 1 - Math.pow(0.0001, dt); // smooth
+        const lerp = 1 - Math.pow(0.0001, dt);
         const next = current + (targetMult - current) * lerp;
         shipShadowMultRef.current = next;
 
         shipStar.key.intensity = STAR_KEY_INTENSITY * next;
-        shipStar.fill.intensity = STAR_FILL_INTENSITY * (0.20 + 0.80 * next); // keep a faint residual
+        shipStar.fill.intensity = STAR_FILL_INTENSITY * (0.12 + 0.88 * next);
+      }
+
+      // update tracers (fade + cleanup)
+      {
+        const now = performance.now();
+        const next: typeof tracersRef.current = [];
+        for (const t of tracersRef.current) {
+          const age = (now - t.born) / 1000;
+          const a = 1 - age / t.ttl;
+
+          if (a <= 0) {
+            t.line.removeFromParent();
+            if (t.line.geometry) t.line.geometry.dispose();
+            const m = t.line.material as any;
+            m?.dispose?.();
+            continue;
+          }
+
+          const m = t.line.material as THREE.LineBasicMaterial;
+          m.opacity = a;
+          next.push(t);
+        }
+        tracersRef.current = next;
       }
 
       // warp tunnel
@@ -1146,11 +1478,9 @@ if (warp?.active) {
         if (warping && warpRef.current) {
           const dir = new THREE.Vector3().copy(warpRef.current.destPos).sub(newShipPos).normalize();
           if (dir.lengthSq() > 0.000001) {
-            q.setFromUnitVectors(baseAxis, dir);
+            q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
             tunnelObj.mesh.quaternion.copy(q);
-            tunnelObj.mesh.position
-              .copy(cam.position)
-              .add(dir.multiplyScalar(WARP_TUNNEL_CENTER_FORWARD));
+            tunnelObj.mesh.position.copy(cam.position).add(dir.multiplyScalar(WARP_TUNNEL_CENTER_FORWARD));
           } else {
             tunnelObj.mesh.position.copy(cam.position);
           }
@@ -1221,7 +1551,10 @@ if (warp?.active) {
       spritesRef.current = [];
       spriteMetaRef.current.clear();
       spriteMatsRef.current.clear();
+
       celestialsRef.current = [];
+      combatSitesRef.current = [];
+      npcsRef.current = [];
 
       bounceKeyRef.current = null;
       bounceBackRef.current = null;
@@ -1233,10 +1566,13 @@ if (warp?.active) {
       approachRef.current = null;
       sublightDirRef.current = null;
       warpExitFlashRef.current = 0;
+
+      tracersRef.current = [];
+      encounterRef.current = null;
     };
   }, []);
 
-  // Load system + build celestials + lighting
+  // Load system + build celestials + lighting + combat site
   useEffect(() => {
     const scene = sceneRef.current;
     const shipObj = shipRef.current;
@@ -1260,12 +1596,16 @@ if (warp?.active) {
       spritesRef.current = [];
       spriteMetaRef.current.clear();
       spriteMatsRef.current.clear();
-      celestialsRef.current = [];
 
-      // remove old celestials + any world lights created in this effect
+      celestialsRef.current = [];
+      combatSitesRef.current = [];
+      npcsRef.current = [];
+      encounterRef.current = null;
+
+      // remove old system objects
       const toRemove: THREE.Object3D[] = [];
       scene.traverse((o) => {
-        if (o.userData?.godCelestial === true) toRemove.push(o);
+        if (o.userData?.godSystem === true) toRemove.push(o);
       });
       for (const o of toRemove) {
         o.removeFromParent();
@@ -1285,13 +1625,13 @@ if (warp?.active) {
       const starKeyWorld = new THREE.PointLight(0xfff0cc, STAR_KEY_INTENSITY, 0, STAR_KEY_DECAY);
       starKeyWorld.position.copy(starPos);
       starKeyWorld.layers.set(LAYER_WORLD);
-      starKeyWorld.userData.godCelestial = true;
+      starKeyWorld.userData.godSystem = true;
       scene.add(starKeyWorld);
 
       const starFillWorld = new THREE.PointLight(0xfff0cc, STAR_FILL_INTENSITY, 0, STAR_FILL_DECAY);
       starFillWorld.position.copy(starPos);
       starFillWorld.layers.set(LAYER_WORLD);
-      starFillWorld.userData.godCelestial = true;
+      starFillWorld.userData.godSystem = true;
       scene.add(starFillWorld);
 
       worldStarLightsRef.current = { key: starKeyWorld, fill: starFillWorld };
@@ -1300,19 +1640,19 @@ if (warp?.active) {
       const starKeyShip = new THREE.PointLight(0xfff0cc, STAR_KEY_INTENSITY, 0, STAR_KEY_DECAY);
       starKeyShip.position.copy(starPos);
       starKeyShip.layers.set(LAYER_SHIP);
-      starKeyShip.userData.godCelestial = true;
+      starKeyShip.userData.godSystem = true;
       scene.add(starKeyShip);
 
       const starFillShip = new THREE.PointLight(0xfff0cc, STAR_FILL_INTENSITY, 0, STAR_FILL_DECAY);
       starFillShip.position.copy(starPos);
       starFillShip.layers.set(LAYER_SHIP);
-      starFillShip.userData.godCelestial = true;
+      starFillShip.userData.godSystem = true;
       scene.add(starFillShip);
 
       shipStarLightsRef.current = { key: starKeyShip, fill: starFillShip };
       shipShadowMultRef.current = 1.0;
 
-      // ✅ update bounce light directions based on star position, targeting ship
+      // update bounce light directions based on star position, targeting ship
       const bounceKey = bounceKeyRef.current;
       const bounceBack = bounceBackRef.current;
 
@@ -1320,14 +1660,12 @@ if (warp?.active) {
         const dir = shipPosRef.current.clone().sub(starPos).normalize();
         bounceKey.position.copy(shipPosRef.current.clone().add(dir.multiplyScalar(1000)));
         bounceKey.target.position.copy(shipPosRef.current);
-        bounceKey.userData.godCelestial = true;
       }
 
       if (bounceBack && bounceBack.target) {
         const dirBack = starPos.clone().sub(shipPosRef.current).normalize();
         bounceBack.position.copy(shipPosRef.current.clone().add(dirBack.multiplyScalar(1000)));
         bounceBack.target.position.copy(shipPosRef.current);
-        bounceBack.userData.godCelestial = true;
       }
 
       // visible star mesh
@@ -1343,12 +1681,12 @@ if (warp?.active) {
           })
         );
         sMesh.position.copy(starPos);
-        sMesh.userData.godCelestial = true;
+        sMesh.userData.godSystem = true;
         sMesh.layers.set(LAYER_WORLD);
         scene.add(sMesh);
 
         // single star marker sprite
-        const starTex = makeCelestialSpriteTexture("star");
+        const starTex = makeMarkerTexture("star");
         const starMarkerMat = new THREE.SpriteMaterial({
           map: starTex,
           transparent: true,
@@ -1360,7 +1698,7 @@ if (warp?.active) {
         const starMarker = new THREE.Sprite(starMarkerMat);
         starMarker.position.copy(starPos);
         (starMarker as any).renderOrder = 9_000;
-        starMarker.userData.godCelestial = true;
+        starMarker.userData.godSystem = true;
         starMarker.layers.set(LAYER_WORLD);
         scene.add(starMarker);
 
@@ -1371,6 +1709,7 @@ if (warp?.active) {
           ...(star as Celestial),
           radiusWorld: starRadius,
           key,
+          posWorld: starPos.clone(),
           warpInWorld,
         };
 
@@ -1379,6 +1718,9 @@ if (warp?.active) {
         spriteMatsRef.current.set(starMarker, starMarkerMat);
         spriteMetaRef.current.set(starMarker, meta);
       }
+
+      let primaryPlanetPos: THREE.Vector3 | null = null;
+      let primaryPlanetRadius: number | null = null;
 
       // skip star in loop so it only appears once
       for (let i = 0; i < sys.celestials.length; i++) {
@@ -1389,9 +1731,14 @@ if (warp?.active) {
         const radiusWorld = radiusMetersToWorld(c.kind, c.radius_m);
         const key = `${c.kind}:${c.name}:${i}`;
 
+        if (!primaryPlanetPos && c.kind === "planet") {
+          primaryPlanetPos = pos.clone();
+          primaryPlanetRadius = radiusWorld;
+        }
+
         const warpInWorld = computeFixedWarpInWorld(starPos, pos, radiusWorld);
 
-        const meta: CelestialMeta = { ...c, radiusWorld, key, warpInWorld };
+        const meta: CelestialMeta = { ...c, radiusWorld, key, posWorld: pos.clone(), warpInWorld };
         celestialsRef.current.push(meta);
 
         const seg = radiusWorld > 0.05 ? 42 : radiusWorld > 0.01 ? 32 : 20;
@@ -1429,12 +1776,12 @@ if (warp?.active) {
           mat
         );
         sphere.position.copy(pos);
-        sphere.userData.godCelestial = true;
+        sphere.userData.godSystem = true;
         sphere.layers.set(LAYER_WORLD);
         scene.add(sphere);
 
         // sprite marker
-        const tex = makeCelestialSpriteTexture(c.kind);
+        const tex = makeMarkerTexture(c.kind);
         const smat = new THREE.SpriteMaterial({
           map: tex,
           transparent: true,
@@ -1445,7 +1792,7 @@ if (warp?.active) {
 
         const sprite = new THREE.Sprite(smat);
         sprite.position.copy(pos);
-        sprite.userData.godCelestial = true;
+        sprite.userData.godSystem = true;
         sprite.layers.set(LAYER_WORLD);
         scene.add(sprite);
 
@@ -1453,6 +1800,41 @@ if (warp?.active) {
         spriteMatsRef.current.set(sprite, smat);
         spriteMetaRef.current.set(sprite, meta);
       }
+
+      // --- Spawn a combat site + start encounter ---
+      const site = spawnDefaultCombatSite(primaryPlanetPos, primaryPlanetRadius, 0);
+      const siteMeta: CombatSiteMeta = {
+        key: site.key,
+        kind: "combat_site",
+        name: site.name,
+        posWorld: site.posWorld.clone(),
+      };
+      combatSitesRef.current = [siteMeta];
+
+      const siteTex = makeMarkerTexture("combat_site");
+      const siteMat = new THREE.SpriteMaterial({
+        map: siteTex,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+        depthTest: true,
+      });
+
+      const siteSprite = new THREE.Sprite(siteMat);
+      siteSprite.position.copy(siteMeta.posWorld);
+      siteSprite.userData.godSystem = true;
+      siteSprite.layers.set(LAYER_WORLD);
+      scene.add(siteSprite);
+
+      spritesRef.current.push(siteSprite);
+      spriteMatsRef.current.set(siteSprite, siteMat);
+      spriteMetaRef.current.set(siteSprite, siteMeta);
+
+      encounterRef.current = {
+        siteKey: siteMeta.key,
+        wave: 0,
+        nextWaveAt: performance.now() + 500,
+      };
     })();
 
     return () => {
@@ -1464,18 +1846,39 @@ if (warp?.active) {
   useEffect(() => {
     const t = setInterval(() => {
       const shipPos = shipPosRef.current;
-      const list = celestialsRef.current;
-      if (!list.length) return;
 
-      const rows: OverviewRow[] = list.map((c) => {
-        const distMeters = effectiveDistanceMeters(shipPos, c);
-        return { key: c.key, name: c.name, kind: c.kind, distMeters };
-      });
+      const rows: OverviewRow[] = [];
+
+      for (const c of celestialsRef.current) {
+        rows.push({
+          key: c.key,
+          name: c.name,
+          kind: c.kind,
+          distMeters: effectiveDistanceMeters(shipPos, c),
+        });
+      }
+
+      for (const s of combatSitesRef.current) {
+        rows.push({
+          key: s.key,
+          name: s.name,
+          kind: s.kind,
+          distMeters: effectiveDistanceMeters(shipPos, s),
+        });
+      }
+
+      for (const n of npcsRef.current) {
+        rows.push({
+          key: n.key,
+          name: n.name,
+          kind: n.kind,
+          distMeters: effectiveDistanceMeters(shipPos, n),
+        });
+      }
 
       rows.sort((a, b) => a.distMeters - b.distMeters);
       setOverviewRows(rows);
 
-      // speed display
       const mps = shipVelRef.current.length() / SCALE_FACTOR;
       setSpeedMps(mps);
     }, 100);
@@ -1548,7 +1951,7 @@ if (warp?.active) {
         return;
       }
       setSelectedKey(hit.meta.key);
-      setCtxMenu({ x: e.clientX, y: e.clientY, celestial: hit.meta });
+      setCtxMenu({ x: e.clientX, y: e.clientY, target: hit.meta });
     };
 
     host.addEventListener("mousemove", onMove);
@@ -1567,25 +1970,22 @@ if (warp?.active) {
     return `${hover.name} (${hover.kind}) • ${formatDistanceMeters(hover.distMeters)}`;
   }, [hover]);
 
-
   const warpPhase = warpRef.current?.phase ?? null;
-    const inWarp = warpPhase === "warp";
-    const inAlign = warpPhase === "align";
+  const inWarp = warpPhase === "warp";
+  const inAlign = warpPhase === "align";
 
-    const speedLabel = inWarp ? "WARP" : inAlign ? "ALIGN" : "SPEED";
-    const speedUnit: "mps" | "aups" = inWarp ? "aups" : "mps";
-
+  const speedLabel = inWarp ? "WARP" : inAlign ? "ALIGN" : "SPEED";
+  const speedUnit: "mps" | "aups" = inWarp ? "aups" : "mps";
 
   const armorPct = Math.max(0, Math.min(1, armor / shipStats.maxArmor));
   const hullPct = Math.max(0, Math.min(1, hull / shipStats.maxHull));
 
-  // speed bar: sublight max (for display)
   const speedMaxMps = inWarp ? (WARP_MAX_SPEED / SCALE_FACTOR) : (SUBLIGHT_MAX_SPEED / SCALE_FACTOR);
   const speedPct = Math.max(0, Math.min(1, speedMps / Math.max(1, speedMaxMps)));
 
   const ctxLockInfo = useMemo(() => {
     if (!ctxMenu) return null;
-    const meta = ctxMenu.celestial;
+    const meta = ctxMenu.target;
     const inRange = canLockNow(meta);
     const atCap = !isLocked(meta.key) && lockedKeysRef.current.length >= MAX_LOCKS;
     return { inRange, atCap };
@@ -1602,11 +2002,18 @@ if (warp?.active) {
       {lockedKeys.length > 0 && (
         <div className="god-locked">
           {lockedKeys.map((k) => {
-            const meta = findCelestialByKey(k);
+            const meta = findSpaceByKey(k);
             if (!meta) return null;
+
             const dist = (overviewRows.find((r) => r.key === k)?.distMeters ?? 0);
-            const hp = targetTestHp[k] ?? 100;
-            const hpPct = Math.max(0, Math.min(1, hp / 100));
+
+            // If it's an NPC, prefer live %; otherwise fall back to stored test HP.
+            const livePct =
+              meta.kind === "npc"
+                ? Math.round((meta.hp / Math.max(1, meta.maxHp)) * 100)
+                : (targetTestHp[k] ?? 100);
+
+            const hpPct = Math.max(0, Math.min(1, livePct / 100));
             const active = activeLockedKey === k;
 
             return (
@@ -1621,7 +2028,7 @@ if (warp?.active) {
                   e.preventDefault();
                   e.stopPropagation();
                   setSelectedKey(k);
-                  setCtxMenu({ x: e.clientX, y: e.clientY, celestial: meta });
+                  setCtxMenu({ x: e.clientX, y: e.clientY, target: meta });
                 }}
                 title="Click to make active target • Right click for menu"
               >
@@ -1656,16 +2063,16 @@ if (warp?.active) {
                 if (lockedKeysRef.current.includes(r.key)) setActiveLockedKey(r.key);
               }}
               onDoubleClick={() => {
-                const meta = findCelestialByKey(r.key);
+                const meta = findSpaceByKey(r.key);
                 if (meta) approachTo(meta);
               }}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                const meta = findCelestialByKey(r.key);
+                const meta = findSpaceByKey(r.key);
                 if (!meta) return;
                 setSelectedKey(r.key);
-                setCtxMenu({ x: e.clientX, y: e.clientY, celestial: meta });
+                setCtxMenu({ x: e.clientX, y: e.clientY, target: meta });
               }}
               title="Double click: approach • Right click: menu"
             >
@@ -1704,12 +2111,12 @@ if (warp?.active) {
               e.stopPropagation();
             }}
           >
-            <div className="god-context-title">{ctxMenu.celestial.name}</div>
+            <div className="god-context-title">{ctxMenu.target.name}</div>
 
             <button
               className="god-btn"
               disabled={inWarp}
-              onClick={() => approachTo(ctxMenu.celestial)}
+              onClick={() => approachTo(ctxMenu.target)}
               title={inWarp ? "Cannot change course while in warp" : "Approach target"}
             >
               Approach
@@ -1717,20 +2124,26 @@ if (warp?.active) {
 
             <button
               className="god-btn"
-              disabled={inWarp}
-              onClick={() => warpTo(ctxMenu.celestial)}
-              title={inWarp ? "Already in warp" : "Warp to target"}
+              disabled={inWarp || ctxMenu.target.kind === "npc"}
+              onClick={() => warpTo(ctxMenu.target)}
+              title={
+                ctxMenu.target.kind === "npc"
+                  ? "Cannot warp to NPCs"
+                  : inWarp
+                    ? "Already in warp"
+                    : "Warp to target"
+              }
             >
               Warp
             </button>
 
-            {!isLocked(ctxMenu.celestial.key) ? (
+            {!isLocked(ctxMenu.target.key) ? (
               <button
                 className="god-btn"
                 disabled={!ctxLockInfo?.inRange || !!ctxLockInfo?.atCap}
                 onClick={() => {
-                  ensureLocked(ctxMenu.celestial.key);
-                  setSelectedKey(ctxMenu.celestial.key);
+                  ensureLocked(ctxMenu.target.key);
+                  setSelectedKey(ctxMenu.target.key);
                   setCtxMenu(null);
                 }}
                 title={
@@ -1747,7 +2160,7 @@ if (warp?.active) {
               <button
                 className="god-btn"
                 onClick={() => {
-                  unlockTarget(ctxMenu.celestial.key);
+                  unlockTarget(ctxMenu.target.key);
                   setCtxMenu(null);
                 }}
                 title="Unlock target"
@@ -1787,7 +2200,6 @@ if (warp?.active) {
               <div className="god-speed-label">
                 <div>{speedLabel}</div>
                 <div>{formatSpeed(speedMps, speedUnit)}</div>
-
               </div>
               <div className="god-speed-bar">
                 <div className="god-speed-fill" style={{ width: `${speedPct * 100}%` }} />
