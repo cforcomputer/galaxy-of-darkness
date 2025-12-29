@@ -5,196 +5,113 @@
   width: 100%;
   height: 100%;
   overflow: hidden;
+  background: #000;
+  user-select: none;
 }
 
 .god-canvas-host {
-  width: 100%;
-  height: 100%;
+  position: absolute;
+  inset: 0;
 }
 
+/* tooltip */
 .god-tooltip {
   position: absolute;
-  left: 16px;
-  top: 16px;
+  left: 14px;
+  top: 14px;
   padding: 6px 8px;
-  background: rgba(0, 0, 0, 0.65);
+  font: 12px/1.2 monospace;
+  color: #eaf2ff;
+  background: rgba(0, 0, 0, 0.78);
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 6px;
-  color: rgba(255, 255, 255, 0.92);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
-  font-size: 12px;
   pointer-events: none;
-  z-index: 2000;
+  z-index: 40;
 }
 
-/* NEW: single full-screen layer that blocks click-through and hosts the menu */
-.god-context-layer {
-  position: fixed;
-  inset: 0;
-  z-index: 4000;
-  pointer-events: auto;
-  background: transparent;
-}
-
-/* CHANGED: menu is SOLID, dense, and always above everything */
-.god-context {
+/* locked targets */
+.god-locked {
   position: absolute;
-  transform: translate(6px, 6px);
-  z-index: 4001;
-
-  min-width: 160px;
-  background: #0b0b0d; /* solid */
-  opacity: 1;
-
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 10px;
-  padding: 6px;
-  display: grid;
-  gap: 6px;
-
-  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
-  pointer-events: auto;
+  top: 10px;
+  right: 310px;
+  display: flex;
+  gap: 8px;
+  z-index: 50;
 }
 
-.god-context-title {
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 11px;
-  font-weight: 650;
-  padding: 2px 4px 6px 4px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
-}
-
-.god-btn {
-  appearance: none;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(255, 255, 255, 0.05);
-  color: rgba(255, 255, 255, 0.92);
+.god-lock {
+  width: 180px;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.84);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 8px;
-  padding: 5px 7px; /* denser */
-  font-size: 11px;  /* denser */
   cursor: pointer;
-  text-align: left;
-  line-height: 1.1;
 }
 
-.god-btn:hover {
-  background: rgba(255, 255, 255, 0.09);
+.god-lock.is-active {
+  border-color: rgba(127, 231, 255, 0.75);
 }
 
-.god-btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
+.god-lock-name {
+  font: 12px/1.1 monospace;
+  color: #eaf2ff;
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* --- Health HUD (center bottom) ------------------------------------------ */
-
-.god-hud-bottom {
-  position: absolute;
-  left: 50%;
-  bottom: 16px;
-  transform: translateX(-50%);
-  z-index: 1800;
-  pointer-events: none;
+.god-lock-sub {
+  display: flex;
+  justify-content: space-between;
+  font: 11px/1.1 monospace;
+  color: rgba(234, 242, 255, 0.72);
+  margin-bottom: 6px;
 }
 
-.god-health {
-  pointer-events: auto;
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 10px;
-  align-items: center;
-  padding: 10px 12px;
-  width: 420px;
-  background: rgba(0, 0, 0, 0.55);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 12px;
-}
-
-.god-bars {
-  display: grid;
-  gap: 8px;
-}
-
-.god-bar-labels {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 8px;
-  align-items: center;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
-  font-size: 11px;
-  color: rgba(255, 255, 255, 0.82);
-}
-
-.god-bar {
-  height: 10px;
-  border-radius: 999px;
+.god-lock-hp {
+  height: 6px;
   background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
   overflow: hidden;
 }
 
-.god-bar-fill {
+.god-lock-hp-fill {
   height: 100%;
-  width: 50%;
-  background: rgba(255, 255, 255, 0.75);
+  background: rgba(127, 231, 255, 0.85);
 }
 
-.god-fire {
-  width: 46px;
-  height: 46px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(255, 255, 255, 0.06);
-  color: rgba(255, 255, 255, 0.9);
-  cursor: pointer;
-  pointer-events: auto;
-  display: grid;
-  place-items: center;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
-  font-size: 12px;
-  user-select: none;
-}
-
-.god-fire:hover {
-  background: rgba(255, 255, 255, 0.10);
-}
-
-.god-fire:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-/* --- Overview (right side; no header/title) ------------------------------- */
-
+/* overview */
 .god-overview {
   position: absolute;
-  right: 16px;
-  top: 16px;
-  z-index: 1700;
-  width: 320px;
-  max-height: calc(100% - 32px);
-  background: rgba(0, 0, 0, 0.55);
+  top: 10px;
+  right: 10px;
+  width: 290px;
+  height: 420px;
+  background: rgba(0, 0, 0, 0.80);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 12px;
+  border-radius: 8px;
+  z-index: 60;
   overflow: hidden;
-  pointer-events: auto;
 }
 
 .god-overview-list {
-  overflow-y: auto;
+  height: 100%;
+  overflow: auto;
 }
 
 .god-overview-row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 10px;
-  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+
+  padding: 2px 6px;           /* dense */
+  font: 11px/1.15 monospace;  /* dense */
+  color: rgba(234, 242, 255, 0.88);
   cursor: pointer;
+
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  user-select: none;
 }
 
 .god-overview-row:hover {
@@ -202,113 +119,187 @@
 }
 
 .god-overview-row.is-selected {
-  background: rgba(255, 255, 255, 0.10);
-  outline: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(127, 231, 255, 0.14);
+}
+
+.god-overview-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.god-overview-type {
+  width: 58px; /* fixed column */
+  color: rgba(234, 242, 255, 0.65);
+  letter-spacing: 0.4px;
+  flex: 0 0 auto;
 }
 
 .god-overview-name {
-  color: rgba(255, 255, 255, 0.90);
-  font-size: 12px;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.god-overview-kind {
-  color: rgba(255, 255, 255, 0.60);
-  font-size: 11px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
 }
 
 .god-overview-dist {
-  color: rgba(255, 255, 255, 0.82);
-  font-size: 11px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
-  white-space: nowrap;
+  flex: 0 0 auto;
+  color: rgba(234, 242, 255, 0.78);
 }
 
-/* --- Locked targets bar (top, left of overview) --------------------------- */
-
-.god-locked {
+/* context menu (opaque) */
+.god-context-layer {
   position: absolute;
-  top: 16px;
-  right: 352px; /* 320 overview + 16 gap */
-  z-index: 1750;
-  display: flex;
-  gap: 8px;
-  align-items: flex-start;
-  pointer-events: auto;
+  inset: 0;
+  z-index: 200;
 }
 
-.god-lock {
-  min-width: 140px;
-  max-width: 180px;
-  padding: 8px 10px;
-  background: rgba(0, 0, 0, 0.55);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 12px;
-  cursor: pointer;
-  user-select: none;
-  display: grid;
-  gap: 6px;
+.god-context {
+  position: absolute;
+  min-width: 180px;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.96); /* opaque */
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
 }
 
-.god-lock:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.god-lock.is-active {
-  outline: 1px solid rgba(127, 231, 255, 0.45);
-  border-color: rgba(127, 231, 255, 0.25);
-}
-
-.god-lock-name {
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 12px;
+.god-context-title {
+  font: 12px/1.1 monospace;
+  color: rgba(234, 242, 255, 0.95);
+  margin-bottom: 8px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.god-lock-sub {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 8px;
-  color: rgba(255, 255, 255, 0.68);
-  font-size: 11px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
+.god-btn {
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px; /* tighter */
+  margin: 4px 0;   /* tighter */
+  font: 12px/1.1 monospace;
+  color: rgba(234, 242, 255, 0.92);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 6px;
+  cursor: pointer;
 }
 
-.god-lock-hp {
-  height: 8px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
+.god-btn:hover {
+  background: rgba(255, 255, 255, 0.10);
+}
+
+.god-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* bottom HUD */
+.god-hud-bottom {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 14px;
+  display: flex;
+  justify-content: center;
+  z-index: 80;
+  pointer-events: none; /* allow canvas interactions except on controls */
+}
+
+.god-health {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(0, 0, 0, 0.78);
   border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 10px;
+  pointer-events: auto;
+}
+
+.god-bars {
+  width: 340px;
+}
+
+.god-bar-labels {
+  display: flex;
+  justify-content: space-between;
+  font: 11px/1.1 monospace;
+  color: rgba(234, 242, 255, 0.80);
+  margin-bottom: 4px;
+}
+
+.god-bar {
+  height: 10px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+
+.god-bar-fill {
+  height: 100%;
+  background: rgba(127, 231, 255, 0.85);
+}
+
+/* speed scale */
+.god-speed {
+  margin-top: 2px;
+}
+
+.god-speed-label {
+  display: flex;
+  justify-content: space-between;
+  font: 11px/1.1 monospace;
+  color: rgba(234, 242, 255, 0.80);
+  margin-bottom: 4px;
+}
+
+.god-speed-bar {
+  height: 8px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 999px;
   overflow: hidden;
 }
 
-.god-lock-hp-fill {
+.god-speed-fill {
   height: 100%;
-  width: 50%;
-  background: rgba(255, 255, 255, 0.75);
+  background: rgba(255, 255, 255, 0.38);
 }
 
+/* fire button */
+.god-fire {
+  width: 56px;
+  height: 56px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.10);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(234, 242, 255, 0.92);
+  font: 14px/1 monospace;
+  cursor: pointer;
+}
+
+.god-fire:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.god-fire:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* corner debug */
 .god-corner {
   position: absolute;
-  left: 16px;
-  bottom: 78px;
-  z-index: 1500;
-  display: grid;
-  gap: 4px;
-  padding: 8px 10px;
-  background: rgba(0, 0, 0, 0.55);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
-  color: rgba(255, 255, 255, 0.85);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
-  font-size: 11px;
+  left: 12px;
+  bottom: 12px;
+  font: 11px/1.2 monospace;
+  color: rgba(234, 242, 255, 0.65);
+  background: rgba(0, 0, 0, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 8px;
+  z-index: 70;
 }

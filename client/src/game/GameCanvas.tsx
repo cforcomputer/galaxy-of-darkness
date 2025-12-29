@@ -72,23 +72,23 @@ const BLOOM_THRESHOLD = 0.93;
 // Lighting tuning
 const EXPOSURE = 1.25;
 
-// ✅ CHANGED: slightly stronger ambient/hemi so dark sides aren’t pitch black
-const AMBIENT_INTENSITY = 0.045; // was 0.020
-const HEMI_INTENSITY = 0.035;    // was 0.012
+// You already tuned these — keeping your current values
+const AMBIENT_INTENSITY = 0.045;
+const HEMI_INTENSITY = 0.035;
 
-// Star lights (keep as before)
+// Star lights (world)
 const STAR_KEY_INTENSITY = 95.0;
 const STAR_KEY_DECAY = 1.7;
 const STAR_FILL_INTENSITY = 1.15;
 const STAR_FILL_DECAY = 0.0;
 
-// ✅ NEW: very soft “global bounce” lights (do NOT wash out)
-const BOUNCE_KEY_INTENSITY = 0.52;  // faint
-const BOUNCE_BACK_INTENSITY = 0.46; // even fainter
-const BOUNCE_COLOR = 0xbfd6ff;      // cool-ish ambient
-const BOUNCE_BACK_COLOR = 0x221b2a; // subtle warm/dark lift
+// Bounce lights (global fill, on both layers)
+const BOUNCE_KEY_INTENSITY = 0.52;
+const BOUNCE_BACK_INTENSITY = 0.46;
+const BOUNCE_COLOR = 0xbfd6ff;
+const BOUNCE_BACK_COLOR = 0x221b2a;
 
-// Base subtle luminance on bodies (keep subtle; don’t rely on emissive)
+// Base subtle luminance on bodies
 const BODY_BASE_LUMINANCE_PLANET = 0.038;
 const BODY_BASE_LUMINANCE_MOON = 0.032;
 const BODY_BASE_LUMINANCE_STATION = 0.028;
@@ -102,6 +102,14 @@ const WARP_TUNNEL_RADIUS = 0.014;
 const WARP_TUNNEL_LENGTH = 0.12;
 const WARP_TUNNEL_CENTER_FORWARD = 0.06;
 
+// Turning / alignment
+const ALIGN_TURN_RATE_RAD = THREE.MathUtils.degToRad(42); // slower align
+const NAV_DIR_SMOOTHING = 1.0; // derived from turn rate (keep 1.0)
+
+// Layers: 0 = world, 1 = ship layer
+const LAYER_WORLD = 0;
+const LAYER_SHIP = 1;
+
 type CelestialMeta = Celestial & {
   radiusWorld: number;
   key: string;
@@ -113,6 +121,14 @@ type OverviewRow = {
   name: string;
   kind: Celestial["kind"];
   distMeters: number;
+};
+
+const KIND_LABEL: Record<Celestial["kind"], string> = {
+  star: "STAR",
+  planet: "PLANET",
+  moon: "MOON",
+  stargate: "GATE",
+  station: "STATION",
 };
 
 function makeCelestialSpriteTexture(kind: Celestial["kind"]) {
@@ -190,6 +206,39 @@ function computeFixedWarpInWorld(
   return bodyPosWorld.clone().add(dir.multiplyScalar(offsetWorld));
 }
 
+// Segment-sphere intersection (ship shadow test)
+function segmentIntersectsSphere(
+  a: THREE.Vector3,
+  b: THREE.Vector3,
+  center: THREE.Vector3,
+  radius: number
+): boolean {
+  const d = b.clone().sub(a);
+  const f = a.clone().sub(center);
+
+  const A = d.dot(d);
+  const B = 2 * f.dot(d);
+  const C = f.dot(f) - radius * radius;
+
+  const disc = B * B - 4 * A * C;
+  if (disc < 0) return false;
+
+  const sqrt = Math.sqrt(disc);
+  const t1 = (-B - sqrt) / (2 * A);
+  const t2 = (-B + sqrt) / (2 * A);
+
+  // any intersection within segment
+  return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1);
+}
+
+function formatSpeed(mps: number) {
+  if (!isFinite(mps)) return "0 m/s";
+  const abs = Math.abs(mps);
+  if (abs >= 10_000) return `${(mps / 1000).toFixed(1)} km/s`;
+  if (abs >= 1000) return `${mps.toFixed(0)} m/s`;
+  return `${mps.toFixed(0)} m/s`;
+}
+
 // --- Sky ----------------------------------------------------------------------
 
 function createProceduralSkySphere() {
@@ -235,6 +284,7 @@ function createProceduralSkySphere() {
   const mesh = new THREE.Mesh(geom, mat);
   mesh.name = "SkySphere";
   mesh.renderOrder = -10_000;
+  mesh.layers.set(LAYER_WORLD);
   return { mesh, mat };
 }
 
@@ -319,6 +369,7 @@ function createWarpTunnelAuroraCylinderWorld() {
   mesh.frustumCulled = false;
   mesh.renderOrder = 10_000;
   mesh.name = "WarpAuroraCylinderWorld";
+  mesh.layers.set(LAYER_WORLD);
 
   return { mesh, uniforms, geom, mat };
 }
@@ -355,6 +406,7 @@ function createWarpFlashPlane() {
   mesh.frustumCulled = false;
   mesh.renderOrder = 20_000;
   mesh.name = "WarpFlash";
+  mesh.layers.set(LAYER_WORLD);
   return { mesh, mat };
 }
 
@@ -374,6 +426,9 @@ export default function GameCanvas({ identityHex }: Props) {
   const shipVelRef = useRef(new THREE.Vector3(0, 0, 0));
   const shipForwardRef = useRef(new THREE.Vector3(1, 0, 0));
   const lastShipPosRef = useRef(new THREE.Vector3(0, 0, 0));
+
+  const navDirRef = useRef(new THREE.Vector3(1, 0, 0)); // smoothed movement direction
+  const shipShadowMultRef = useRef(1.0); // smoothed sunlight occlusion multiplier
 
   const starPosWorldRef = useRef(new THREE.Vector3(0, 0, 0));
 
@@ -423,9 +478,15 @@ export default function GameCanvas({ identityHex }: Props) {
 
   const celestialsRef = useRef<CelestialMeta[]>([]);
 
-  // ✅ NEW: bounce lights refs so we can update their direction after ESI load
+  // Bounce lights refs so we can update their direction after ESI load
   const bounceKeyRef = useRef<THREE.DirectionalLight | null>(null);
   const bounceBackRef = useRef<THREE.DirectionalLight | null>(null);
+
+  // World star lights (do NOT affect ship)
+  const worldStarLightsRef = useRef<{ key: THREE.PointLight; fill: THREE.PointLight } | null>(null);
+
+  // Ship-only star lights (these get occluded by planets)
+  const shipStarLightsRef = useRef<{ key: THREE.PointLight; fill: THREE.PointLight } | null>(null);
 
   const [systemName, setSystemName] = useState("Loading…");
   const [hover, setHover] = useState<HoverInfo | null>(null);
@@ -440,6 +501,8 @@ export default function GameCanvas({ identityHex }: Props) {
 
   const [armor, setArmor] = useState(shipStats.maxArmor);
   const [hull, setHull] = useState(shipStats.maxHull);
+
+  const [speedMps, setSpeedMps] = useState(0);
 
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const selectedKeyRef = useRef<string | null>(null);
@@ -477,12 +540,6 @@ export default function GameCanvas({ identityHex }: Props) {
   useEffect(() => {
     firingRef.current = firing;
   }, [firing]);
-
-  const distByKey = useMemo(() => {
-    const map: Record<string, number> = {};
-    for (const r of overviewRows) map[r.key] = r.distMeters;
-    return map;
-  }, [overviewRows]);
 
   const findCelestialByKey = (key: string | null): CelestialMeta | null => {
     if (!key) return null;
@@ -574,6 +631,9 @@ export default function GameCanvas({ identityHex }: Props) {
 
     const shipPos = shipPosRef.current;
     const dir = dest.clone().sub(shipPos).normalize();
+
+    // Warp direction snaps (warp is “rail”)
+    navDirRef.current.copy(dir);
     shipForwardRef.current.copy(dir);
     shipVelRef.current.copy(dir.multiplyScalar(WARP_MIN_SPEED));
 
@@ -595,6 +655,10 @@ export default function GameCanvas({ identityHex }: Props) {
       1e-7,
       1_000_000_000
     );
+
+    // IMPORTANT: camera must render both world + ship layers
+    camera.layers.enable(LAYER_SHIP);
+
     camera.position.set(0.00003, 0.000012, 0.00003);
     scene.add(camera);
 
@@ -640,16 +704,22 @@ export default function GameCanvas({ identityHex }: Props) {
     scene.add(sky.mesh);
     skyRef.current = sky;
 
-    // ✅ CHANGED: slightly stronger ambient + hemi for “space fill”
-    scene.add(new THREE.AmbientLight(0xffffff, AMBIENT_INTENSITY));
-    scene.add(new THREE.HemisphereLight(0xcfe3ff, 0x08060c, HEMI_INTENSITY));
+    // Ambient + hemi should affect both world and ship
+    const amb = new THREE.AmbientLight(0xffffff, AMBIENT_INTENSITY);
+    amb.layers.enable(LAYER_SHIP);
+    scene.add(amb);
 
-    // ✅ NEW: soft global bounce keyed off star direction (positions get set after ESI load)
+    const hemi = new THREE.HemisphereLight(0xcfe3ff, 0x08060c, HEMI_INTENSITY);
+    hemi.layers.enable(LAYER_SHIP);
+    scene.add(hemi);
+
+    // Bounce lights should affect both world and ship
     const bounceKey = new THREE.DirectionalLight(BOUNCE_COLOR, BOUNCE_KEY_INTENSITY);
     bounceKey.position.set(1, 1, 1);
     bounceKey.target.position.set(0, 0, 0);
     bounceKey.castShadow = false;
-    bounceKey.userData.godCelestial = true; // will be cleared on reload
+    bounceKey.userData.godCelestial = true;
+    bounceKey.layers.enable(LAYER_SHIP);
     scene.add(bounceKey);
     scene.add(bounceKey.target);
     bounceKeyRef.current = bounceKey;
@@ -659,13 +729,15 @@ export default function GameCanvas({ identityHex }: Props) {
     bounceBack.target.position.set(0, 0, 0);
     bounceBack.castShadow = false;
     bounceBack.userData.godCelestial = true;
+    bounceBack.layers.enable(LAYER_SHIP);
     scene.add(bounceBack);
     scene.add(bounceBack.target);
     bounceBackRef.current = bounceBack;
 
-    // Ship cube
+    // Ship cube on ship layer
+    const shipSize = shipStats.size_m * SCALE_FACTOR;
     const ship = new THREE.Mesh(
-      new THREE.BoxGeometry(shipSizeW, shipSizeW, shipSizeW),
+      new THREE.BoxGeometry(shipSize, shipSize, shipSize),
       new THREE.MeshStandardMaterial({
         color: 0xdde6ef,
         emissive: new THREE.Color(0x334455),
@@ -675,6 +747,7 @@ export default function GameCanvas({ identityHex }: Props) {
       })
     );
     ship.position.copy(shipPosRef.current);
+    ship.layers.set(LAYER_SHIP);
     scene.add(ship);
     shipRef.current = ship;
 
@@ -719,6 +792,24 @@ export default function GameCanvas({ identityHex }: Props) {
         const next = Math.max(0, cur - 5);
         return { ...prev, [targetKey]: next };
       });
+    };
+
+    const updateNavDirection = (desired: THREE.Vector3, dt: number) => {
+      const nav = navDirRef.current;
+      if (desired.lengthSq() < 1e-10) return nav;
+
+      desired.normalize();
+      const angle = nav.angleTo(desired);
+      if (angle < 1e-6) {
+        nav.copy(desired);
+        return nav;
+      }
+
+      const maxStep = ALIGN_TURN_RATE_RAD * dt * NAV_DIR_SMOOTHING;
+      const t = Math.min(1, maxStep / angle);
+
+      nav.lerp(desired, t).normalize();
+      return nav;
     };
 
     const stepMovement = (dt: number) => {
@@ -768,6 +859,9 @@ export default function GameCanvas({ identityHex }: Props) {
         }
 
         const dir = toDest.normalize();
+
+        // Warp direction snaps
+        navDirRef.current.copy(dir);
         shipForwardRef.current.copy(dir);
 
         const remaining = Math.max(1e-7, dist - stopDist);
@@ -812,8 +906,9 @@ export default function GameCanvas({ identityHex }: Props) {
           return;
         }
 
-        const dir = to.normalize();
-        shipForwardRef.current.copy(dir);
+        const desired = to.normalize();
+        const nav = updateNavDirection(desired, dt);
+        shipForwardRef.current.copy(nav);
 
         const remaining = Math.max(1e-7, dist - stopDist);
         const v = shipVel.length();
@@ -826,7 +921,8 @@ export default function GameCanvas({ identityHex }: Props) {
           newSpeed = Math.min(SUBLIGHT_MAX_SPEED, v + SUBLIGHT_ACCEL * dt);
         }
 
-        shipVel.copy(dir.multiplyScalar(newSpeed));
+        // velocity direction follows the gradually-aligning nav dir
+        shipVel.copy(nav.clone().multiplyScalar(newSpeed));
         shipPos.addScaledVector(shipVel, dt);
         return;
       }
@@ -844,7 +940,8 @@ export default function GameCanvas({ identityHex }: Props) {
         return;
       }
 
-      shipForwardRef.current.copy(desiredDir);
+      const nav = updateNavDirection(desiredDir.clone().normalize(), dt);
+      shipForwardRef.current.copy(nav);
 
       const currentSpeed = shipVel.length();
       const targetSpeed = SUBLIGHT_MAX_SPEED;
@@ -856,7 +953,7 @@ export default function GameCanvas({ identityHex }: Props) {
         newSpeed = Math.max(targetSpeed, currentSpeed - SUBLIGHT_DECEL * dt);
       }
 
-      shipVel.copy(desiredDir.clone().multiplyScalar(newSpeed));
+      shipVel.copy(nav.clone().multiplyScalar(newSpeed));
       shipPos.addScaledVector(shipVel, dt);
     };
 
@@ -888,7 +985,7 @@ export default function GameCanvas({ identityHex }: Props) {
       shipObj.position.copy(newShipPos);
       ctrl.target.copy(newShipPos);
 
-      // ship faces intended direction
+      // ship faces smoothed nav dir
       const fwdDir = shipForwardRef.current;
       if (fwdDir.lengthSq() > 0.000001) {
         shipObj.lookAt(shipObj.position.clone().add(fwdDir));
@@ -898,7 +995,7 @@ export default function GameCanvas({ identityHex }: Props) {
       ctrl.maxDistance = warping ? CAMERA_MAX_DISTANCE_WARP : CAMERA_MAX_DISTANCE_DEFAULT;
 
       // clamp camera distance
-      const camToTarget = tmp.copy(cam.position).sub(ctrl.target);
+      const camToTarget = new THREE.Vector3().copy(cam.position).sub(ctrl.target);
       const camDist = camToTarget.length();
       if (camDist > ctrl.maxDistance) {
         cam.position.copy(
@@ -938,6 +1035,36 @@ export default function GameCanvas({ identityHex }: Props) {
         }
       }
 
+      // --- Ship sunlight occlusion (shadow) ---
+      // World star lights keep illuminating planets normally (layer 0).
+      // Ship has its own star lights (layer 1) and we dim them if a planet/moon blocks line-of-sight.
+      const shipStar = shipStarLightsRef.current;
+      if (shipStar) {
+        const starPos = starPosWorldRef.current;
+        let occluded = false;
+
+        // Only planets/moons can occlude ship sunlight
+        const bodies = celestialsRef.current;
+        for (const c of bodies) {
+          if (c.kind !== "planet" && c.kind !== "moon") continue;
+          const center = mToWorld(c.position_m);
+          const r = c.radiusWorld * 1.02; // slight expansion to make shadows feel “real”
+          if (segmentIntersectsSphere(starPos, newShipPos, center, r)) {
+            occluded = true;
+            break;
+          }
+        }
+
+        const targetMult = occluded ? 0.06 : 1.0; // in shadow: almost no direct sunlight
+        const current = shipShadowMultRef.current;
+        const lerp = 1 - Math.pow(0.0001, dt); // smooth
+        const next = current + (targetMult - current) * lerp;
+        shipShadowMultRef.current = next;
+
+        shipStar.key.intensity = STAR_KEY_INTENSITY * next;
+        shipStar.fill.intensity = STAR_FILL_INTENSITY * (0.20 + 0.80 * next); // keep a faint residual
+      }
+
       // warp tunnel
       if (tunnelObj) {
         tunnelObj.uniforms.uTime.value += dt;
@@ -961,7 +1088,7 @@ export default function GameCanvas({ identityHex }: Props) {
         tunnelObj.mesh.visible = tunnelObj.uniforms.uIntensity.value > 0.01;
 
         if (warping && warpRef.current) {
-          const dir = tmp2.copy(warpRef.current.destPos).sub(newShipPos).normalize();
+          const dir = new THREE.Vector3().copy(warpRef.current.destPos).sub(newShipPos).normalize();
           if (dir.lengthSq() > 0.000001) {
             q.setFromUnitVectors(baseAxis, dir);
             tunnelObj.mesh.quaternion.copy(q);
@@ -1043,6 +1170,9 @@ export default function GameCanvas({ identityHex }: Props) {
       bounceKeyRef.current = null;
       bounceBackRef.current = null;
 
+      worldStarLightsRef.current = null;
+      shipStarLightsRef.current = null;
+
       warpRef.current = null;
       approachRef.current = null;
       sublightDirRef.current = null;
@@ -1076,7 +1206,7 @@ export default function GameCanvas({ identityHex }: Props) {
       spriteMatsRef.current.clear();
       celestialsRef.current = [];
 
-      // remove old celestials + lights
+      // remove old celestials + any world lights created in this effect
       const toRemove: THREE.Object3D[] = [];
       scene.traverse((o) => {
         if (o.userData?.godCelestial === true) toRemove.push(o);
@@ -1086,39 +1216,58 @@ export default function GameCanvas({ identityHex }: Props) {
         safeDispose(o);
       }
 
+      worldStarLightsRef.current = null;
+      shipStarLightsRef.current = null;
+
       const star = sys.celestials.find((c) => c.kind === "star") ?? null;
       const starPos = star ? mToWorld(star.position_m) : new THREE.Vector3();
       starPosWorldRef.current.copy(starPos);
 
       const starRadius = star ? radiusMetersToWorld(star.kind, star.radius_m) : 0.02;
 
-      // star lights
-      const starKey = new THREE.PointLight(0xfff0cc, STAR_KEY_INTENSITY, 0, STAR_KEY_DECAY);
-      starKey.position.copy(starPos);
-      starKey.userData.godCelestial = true;
-      scene.add(starKey);
+      // --- World star lights (layer 0 only) ---
+      const starKeyWorld = new THREE.PointLight(0xfff0cc, STAR_KEY_INTENSITY, 0, STAR_KEY_DECAY);
+      starKeyWorld.position.copy(starPos);
+      starKeyWorld.layers.set(LAYER_WORLD);
+      starKeyWorld.userData.godCelestial = true;
+      scene.add(starKeyWorld);
 
-      const starFill = new THREE.PointLight(0xfff0cc, STAR_FILL_INTENSITY, 0, STAR_FILL_DECAY);
-      starFill.position.copy(starPos);
-      starFill.userData.godCelestial = true;
-      scene.add(starFill);
+      const starFillWorld = new THREE.PointLight(0xfff0cc, STAR_FILL_INTENSITY, 0, STAR_FILL_DECAY);
+      starFillWorld.position.copy(starPos);
+      starFillWorld.layers.set(LAYER_WORLD);
+      starFillWorld.userData.godCelestial = true;
+      scene.add(starFillWorld);
 
-      // ✅ NEW: update bounce light directions based on star position
-      // DirectionalLight points from its position toward its target.
-      // We want the bounce to be a soft "skylight" from the star direction and a faint back lift.
+      worldStarLightsRef.current = { key: starKeyWorld, fill: starFillWorld };
+
+      // --- Ship-only star lights (layer 1 only; these get occluded) ---
+      const starKeyShip = new THREE.PointLight(0xfff0cc, STAR_KEY_INTENSITY, 0, STAR_KEY_DECAY);
+      starKeyShip.position.copy(starPos);
+      starKeyShip.layers.set(LAYER_SHIP);
+      starKeyShip.userData.godCelestial = true;
+      scene.add(starKeyShip);
+
+      const starFillShip = new THREE.PointLight(0xfff0cc, STAR_FILL_INTENSITY, 0, STAR_FILL_DECAY);
+      starFillShip.position.copy(starPos);
+      starFillShip.layers.set(LAYER_SHIP);
+      starFillShip.userData.godCelestial = true;
+      scene.add(starFillShip);
+
+      shipStarLightsRef.current = { key: starKeyShip, fill: starFillShip };
+      shipShadowMultRef.current = 1.0;
+
+      // ✅ update bounce light directions based on star position, targeting ship
       const bounceKey = bounceKeyRef.current;
       const bounceBack = bounceBackRef.current;
 
       if (bounceKey && bounceKey.target) {
-        // Place the light far away in the star direction and point it at the ship.
-        const dir = shipPosRef.current.clone().sub(starPos).normalize(); // away from star -> "lit side" direction
+        const dir = shipPosRef.current.clone().sub(starPos).normalize();
         bounceKey.position.copy(shipPosRef.current.clone().add(dir.multiplyScalar(1000)));
         bounceKey.target.position.copy(shipPosRef.current);
         bounceKey.userData.godCelestial = true;
       }
 
       if (bounceBack && bounceBack.target) {
-        // Opposite direction, weaker: lifts the very dark silhouette
         const dirBack = starPos.clone().sub(shipPosRef.current).normalize();
         bounceBack.position.copy(shipPosRef.current.clone().add(dirBack.multiplyScalar(1000)));
         bounceBack.target.position.copy(shipPosRef.current);
@@ -1139,6 +1288,7 @@ export default function GameCanvas({ identityHex }: Props) {
         );
         sMesh.position.copy(starPos);
         sMesh.userData.godCelestial = true;
+        sMesh.layers.set(LAYER_WORLD);
         scene.add(sMesh);
 
         // single star marker sprite
@@ -1155,6 +1305,7 @@ export default function GameCanvas({ identityHex }: Props) {
         starMarker.position.copy(starPos);
         (starMarker as any).renderOrder = 9_000;
         starMarker.userData.godCelestial = true;
+        starMarker.layers.set(LAYER_WORLD);
         scene.add(starMarker);
 
         const key = `star:${star.name}`;
@@ -1223,6 +1374,7 @@ export default function GameCanvas({ identityHex }: Props) {
         );
         sphere.position.copy(pos);
         sphere.userData.godCelestial = true;
+        sphere.layers.set(LAYER_WORLD);
         scene.add(sphere);
 
         // sprite marker
@@ -1238,6 +1390,7 @@ export default function GameCanvas({ identityHex }: Props) {
         const sprite = new THREE.Sprite(smat);
         sprite.position.copy(pos);
         sprite.userData.godCelestial = true;
+        sprite.layers.set(LAYER_WORLD);
         scene.add(sprite);
 
         spritesRef.current.push(sprite);
@@ -1265,6 +1418,10 @@ export default function GameCanvas({ identityHex }: Props) {
 
       rows.sort((a, b) => a.distMeters - b.distMeters);
       setOverviewRows(rows);
+
+      // speed display
+      const mps = shipVelRef.current.length() / SCALE_FACTOR;
+      setSpeedMps(mps);
     }, 100);
 
     return () => clearInterval(t);
@@ -1359,6 +1516,10 @@ export default function GameCanvas({ identityHex }: Props) {
   const armorPct = Math.max(0, Math.min(1, armor / shipStats.maxArmor));
   const hullPct = Math.max(0, Math.min(1, hull / shipStats.maxHull));
 
+  // speed bar: sublight max (for display)
+  const speedMaxMps = inWarp ? (WARP_MAX_SPEED / SCALE_FACTOR) : (SUBLIGHT_MAX_SPEED / SCALE_FACTOR);
+  const speedPct = Math.max(0, Math.min(1, speedMps / Math.max(1, speedMaxMps)));
+
   const ctxLockInfo = useMemo(() => {
     if (!ctxMenu) return null;
     const meta = ctxMenu.celestial;
@@ -1415,7 +1576,7 @@ export default function GameCanvas({ identityHex }: Props) {
         </div>
       )}
 
-      {/* Overview */}
+      {/* Overview (dense, single-line, type column) */}
       <div
         className="god-overview"
         onMouseDown={(e) => e.stopPropagation()}
@@ -1445,9 +1606,9 @@ export default function GameCanvas({ identityHex }: Props) {
               }}
               title="Double click: approach • Right click: menu"
             >
-              <div>
+              <div className="god-overview-left">
+                <div className="god-overview-type">{KIND_LABEL[r.kind]}</div>
                 <div className="god-overview-name">{r.name}</div>
-                <div className="god-overview-kind">{r.kind}</div>
               </div>
               <div className="god-overview-dist">{formatDistanceMeters(r.distMeters)}</div>
             </div>
@@ -1535,7 +1696,7 @@ export default function GameCanvas({ identityHex }: Props) {
         </div>
       )}
 
-      {/* Health + Fire control */}
+      {/* Health + Fire control + Speed scale */}
       <div className="god-hud-bottom">
         <div className="god-health">
           <div className="god-bars">
@@ -1557,6 +1718,16 @@ export default function GameCanvas({ identityHex }: Props) {
             </div>
             <div className="god-bar">
               <div className="god-bar-fill" style={{ width: `${hullPct * 100}%` }} />
+            </div>
+
+            <div className="god-speed">
+              <div className="god-speed-label">
+                <div>{inWarp ? "WARP" : "SPEED"}</div>
+                <div>{formatSpeed(speedMps)}</div>
+              </div>
+              <div className="god-speed-bar">
+                <div className="god-speed-fill" style={{ width: `${speedPct * 100}%` }} />
+              </div>
             </div>
           </div>
 
