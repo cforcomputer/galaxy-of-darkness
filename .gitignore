@@ -1,0 +1,105 @@
+################################################################################
+# OS / Editor
+################################################################################
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+*.tmp
+
+################################################################################
+# Logs
+################################################################################
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+################################################################################
+# Node / Vite / React (client)
+################################################################################
+node_modules/
+**/node_modules/
+
+client/dist/
+client/.vite/
+client/.cache/
+client/coverage/
+client/.env
+client/.env.*
+client/*.local
+
+# Optional: keep lockfiles tracked (recommended)
+# (Do not ignore pnpm-lock.yaml / package-lock.json / yarn.lock unless you choose to)
+
+################################################################################
+# TypeScript / tooling caches
+################################################################################
+*.tsbuildinfo
+.eslintcache
+.stylelintcache
+
+################################################################################
+# Rust / Cargo (spacetimedb module)
+################################################################################
+target/
+**/target/
+
+# Cargo local config can contain machine-specific paths; ignore by default
+.cargo/
+**/.cargo/
+
+# Rust analyzer / IDE outputs
+rust-analyzer/
+**/.rustc_info.json
+
+################################################################################
+# SpacetimeDB local data / config / generated artifacts
+################################################################################
+# SpacetimeDB CLI local config + auth tokens (Windows path lives elsewhere too,
+# but keep any repo-local config out of git)
+spacetimedb/.spacetimedb/
+**/.spacetimedb/
+
+# Local database files / runtime state (if created inside repo)
+spacetimedb/db/
+spacetimedb/data/
+spacetimedb/.data/
+spacetimedb/.db/
+spacetimedb/.local/
+spacetimedb/.cache/
+
+# Generated module bindings (choose ONE strategy):
+# - If you want reproducible builds, keep bindings OUT of git (recommended).
+client/src/module_bindings/
+**/module_bindings/
+
+################################################################################
+# Build artifacts / misc
+################################################################################
+dist/
+build/
+out/
+
+################################################################################
+# Env files anywhere
+################################################################################
+.env
+.env.*
+*.env
+*.env.*
+
+################################################################################
+# Optional: lockfiles (UNCOMMENT if you explicitly do not want them tracked)
+################################################################################
+# pnpm-lock.yaml
+# package-lock.json
+# yarn.lock

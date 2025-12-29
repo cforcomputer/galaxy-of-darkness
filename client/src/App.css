@@ -1,0 +1,93 @@
+/* client/src/App.css */
+.god-fullscreen {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  overflow: hidden;
+}
+
+.god-canvas-root {
+  position: absolute;
+  inset: 0;
+}
+
+.god-canvas-host {
+  position: absolute;
+  inset: 0;
+}
+
+/* overlays */
+.god-tooltip {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.92);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+/* denser context menu */
+.god-context {
+  position: fixed;
+  transform: translate(6px, 6px);
+  min-width: 140px;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 10px;
+  color: rgba(255, 255, 255, 0.92);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  z-index: 10;
+}
+
+.god-context-title {
+  font-size: 11px;
+  margin-bottom: 6px;
+  line-height: 1.1;
+  color: rgba(255, 255, 255, 0.95);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.god-btn {
+  width: 100%;
+  padding: 7px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.god-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.god-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.god-corner {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.65);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  pointer-events: none;
+}
