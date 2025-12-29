@@ -39,6 +39,11 @@ const FALLBACK_RADIUS_M: Record<Celestial["kind"], number> = {
 
 const WARP_IN_BUFFER_M = 10_000;
 
+const WARP_ALIGN_SPEED_FRAC = 0.75; // must be at 75% sublight max before entering warp
+const WARP_ALIGN_ANGLE_EPS = THREE.MathUtils.degToRad(3); // degrees from desired dir
+const WARP_ALIGN_MIN_TIME = 0.35; // prevents “instant” warp from standstill
+
+
 // Lock constraints
 const LOCK_RANGE_M = 100_000; // 100 km
 const MAX_LOCKS = 5;
@@ -231,13 +236,23 @@ function segmentIntersectsSphere(
   return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1);
 }
 
-function formatSpeed(mps: number) {
-  if (!isFinite(mps)) return "0 m/s";
+const AU_METERS = 149_597_870_700; // 1 AU in meters
+
+function formatSpeed(mps: number, unit: "mps" | "aups") {
+  if (!isFinite(mps)) return unit === "aups" ? "0.00 AU/s" : "0 m/s";
+
+  if (unit === "aups") {
+    const aups = mps / AU_METERS;
+    return `${aups.toFixed(2)} AU/s`;
+  }
+
+  // m/s / km/s formatting
   const abs = Math.abs(mps);
   if (abs >= 10_000) return `${(mps / 1000).toFixed(1)} km/s`;
   if (abs >= 1000) return `${mps.toFixed(0)} m/s`;
   return `${mps.toFixed(0)} m/s`;
 }
+
 
 // --- Sky ----------------------------------------------------------------------
 
@@ -463,12 +478,15 @@ export default function GameCanvas({ identityHex }: Props) {
   } | null>(null);
 
   const warpRef = useRef<{
-    active: boolean;
-    destPos: THREE.Vector3;
-    centerPos: THREE.Vector3;
-    targetName: string;
-    targetKey: string;
-  } | null>(null);
+  active: boolean;
+  phase: "align" | "warp";
+  destPos: THREE.Vector3;
+  centerPos: THREE.Vector3;
+  targetName: string;
+  targetKey: string;
+  alignTime: number;
+} | null>(null);
+
 
   const spriteMetaRef = useRef<Map<THREE.Object3D, CelestialMeta>>(new Map());
   const spritesRef = useRef<THREE.Sprite[]>([]);
@@ -613,32 +631,29 @@ export default function GameCanvas({ identityHex }: Props) {
   };
 
   const warpTo = (c: CelestialMeta) => {
-    if (warpRef.current?.active) return;
+  if (warpRef.current?.active) return;
 
-    approachRef.current = null;
-    sublightDirRef.current = null;
+  approachRef.current = null;
+  sublightDirRef.current = null;
 
-    const dest = c.warpInWorld.clone();
-    const center = mToWorld(c.position_m);
+  const dest = c.warpInWorld.clone();
+  const center = mToWorld(c.position_m);
 
-    warpRef.current = {
-      active: true,
-      destPos: dest,
-      centerPos: center,
-      targetName: c.name,
-      targetKey: c.key,
-    };
-
-    const shipPos = shipPosRef.current;
-    const dir = dest.clone().sub(shipPos).normalize();
-
-    // Warp direction snaps (warp is “rail”)
-    navDirRef.current.copy(dir);
-    shipForwardRef.current.copy(dir);
-    shipVelRef.current.copy(dir.multiplyScalar(WARP_MIN_SPEED));
-
-    setCtxMenu(null);
+  warpRef.current = {
+    active: true,
+    phase: "align",
+    destPos: dest,
+    centerPos: center,
+    targetName: c.name,
+    targetKey: c.key,
+    alignTime: 0,
   };
+
+  // Do NOT snap facing or velocity here.
+  // Alignment happens gradually in the movement step.
+  setCtxMenu(null);
+};
+
 
   useEffect(() => {
     const host = canvasHostRef.current;
@@ -842,52 +857,93 @@ export default function GameCanvas({ identityHex }: Props) {
         }
       }
 
-      // warp
-      const warp = warpRef.current;
-      if (warp?.active) {
-        const toDest = warp.destPos.clone().sub(shipPos);
-        const dist = toDest.length();
+      // warp (two-phase: align -> warp)
+const warp = warpRef.current;
+if (warp?.active) {
+  const toDest = warp.destPos.clone().sub(shipPos);
+  const dist = toDest.length();
 
-        const stopDist = Math.max(shipStats.size_m * SCALE_FACTOR * 10, 1e-7);
+  const stopDist = Math.max(shipStats.size_m * SCALE_FACTOR * 10, 1e-7);
 
-        if (dist <= stopDist) {
-          shipPos.copy(warp.destPos);
-          shipVel.set(0, 0, 0);
-          warpExitFlashRef.current = 1.0;
-          warpRef.current = null;
-          return;
-        }
+  // If we're basically at destination (edge case), finish immediately.
+  if (dist <= stopDist) {
+    shipPos.copy(warp.destPos);
+    shipVel.set(0, 0, 0);
+    warpExitFlashRef.current = 1.0;
+    warpRef.current = null;
+    return;
+  }
 
-        const dir = toDest.normalize();
+  const desired = toDest.normalize();
 
-        // Warp direction snaps
-        navDirRef.current.copy(dir);
-        shipForwardRef.current.copy(dir);
+  // --- PHASE 1: ALIGN ---
+  if (warp.phase === "align") {
+    warp.alignTime += dt;
 
-        const remaining = Math.max(1e-7, dist - stopDist);
-        const v = shipVel.length();
-        const requiredDecel = (v * v) / (2 * remaining);
+    // Gradually rotate toward desired
+    const nav = updateNavDirection(desired.clone(), dt);
+    shipForwardRef.current.copy(nav);
 
-        let newSpeed = v;
-        if (requiredDecel > WARP_DECEL * 0.92) {
-          newSpeed = Math.max(0, v - WARP_DECEL * dt);
-        } else {
-          newSpeed = Math.min(WARP_MAX_SPEED, v + WARP_ACCEL * dt);
-        }
-        if (newSpeed > 0) newSpeed = Math.max(newSpeed, WARP_MIN_SPEED);
+    // Spool up to 75% of sublight max
+    const alignSpeed = SUBLIGHT_MAX_SPEED * WARP_ALIGN_SPEED_FRAC;
 
-        shipVel.copy(dir.multiplyScalar(newSpeed));
-        shipPos.addScaledVector(shipVel, dt);
+    const v = shipVel.length();
+    let newSpeed = v;
 
-        const after = warp.destPos.clone().sub(shipPos);
-        if (after.dot(dir) < 0) {
-          shipPos.copy(warp.destPos);
-          shipVel.set(0, 0, 0);
-          warpExitFlashRef.current = 1.0;
-          warpRef.current = null;
-        }
-        return;
-      }
+    if (v < alignSpeed) newSpeed = Math.min(alignSpeed, v + SUBLIGHT_ACCEL * dt);
+    else newSpeed = Math.max(alignSpeed, v - SUBLIGHT_DECEL * dt);
+
+    shipVel.copy(nav.clone().multiplyScalar(newSpeed));
+    shipPos.addScaledVector(shipVel, dt);
+
+    const angle = nav.angleTo(desired);
+    const speedOk = newSpeed >= alignSpeed * 0.98;
+    const angleOk = angle <= WARP_ALIGN_ANGLE_EPS;
+    const timeOk = warp.alignTime >= WARP_ALIGN_MIN_TIME;
+
+    if (angleOk && speedOk && timeOk) {
+      // Enter warp
+      warp.phase = "warp";
+      navDirRef.current.copy(desired);
+      shipForwardRef.current.copy(desired);
+
+      const startWarpSpeed = Math.max(WARP_MIN_SPEED, shipVel.length());
+      shipVel.copy(desired.clone().multiplyScalar(startWarpSpeed));
+    }
+
+    return;
+  }
+
+  // --- PHASE 2: WARP ---
+  // Warp direction is fixed
+  navDirRef.current.copy(desired);
+  shipForwardRef.current.copy(desired);
+
+  const remaining = Math.max(1e-7, dist - stopDist);
+  const v = shipVel.length();
+  const requiredDecel = (v * v) / (2 * remaining);
+
+  let newSpeed = v;
+  if (requiredDecel > WARP_DECEL * 0.92) {
+    newSpeed = Math.max(0, v - WARP_DECEL * dt);
+  } else {
+    newSpeed = Math.min(WARP_MAX_SPEED, v + WARP_ACCEL * dt);
+  }
+  if (newSpeed > 0) newSpeed = Math.max(newSpeed, WARP_MIN_SPEED);
+
+  shipVel.copy(desired.clone().multiplyScalar(newSpeed));
+  shipPos.addScaledVector(shipVel, dt);
+
+  const after = warp.destPos.clone().sub(shipPos);
+  if (after.dot(desired) < 0) {
+    shipPos.copy(warp.destPos);
+    shipVel.set(0, 0, 0);
+    warpExitFlashRef.current = 1.0;
+    warpRef.current = null;
+  }
+  return;
+}
+
 
       // approach mode
       const approach = approachRef.current;
@@ -1511,7 +1567,14 @@ export default function GameCanvas({ identityHex }: Props) {
     return `${hover.name} (${hover.kind}) • ${formatDistanceMeters(hover.distMeters)}`;
   }, [hover]);
 
-  const inWarp = !!warpRef.current?.active;
+
+  const warpPhase = warpRef.current?.phase ?? null;
+    const inWarp = warpPhase === "warp";
+    const inAlign = warpPhase === "align";
+
+    const speedLabel = inWarp ? "WARP" : inAlign ? "ALIGN" : "SPEED";
+    const speedUnit: "mps" | "aups" = inWarp ? "aups" : "mps";
+
 
   const armorPct = Math.max(0, Math.min(1, armor / shipStats.maxArmor));
   const hullPct = Math.max(0, Math.min(1, hull / shipStats.maxHull));
@@ -1722,8 +1785,9 @@ export default function GameCanvas({ identityHex }: Props) {
 
             <div className="god-speed">
               <div className="god-speed-label">
-                <div>{inWarp ? "WARP" : "SPEED"}</div>
-                <div>{formatSpeed(speedMps)}</div>
+                <div>{speedLabel}</div>
+                <div>{formatSpeed(speedMps, speedUnit)}</div>
+
               </div>
               <div className="god-speed-bar">
                 <div className="god-speed-fill" style={{ width: `${speedPct * 100}%` }} />
